@@ -1,6 +1,7 @@
 package doctor_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -112,6 +113,62 @@ func TestRunRejectsInvalidWorkingDirectory(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "stat process working directory") {
 		t.Fatalf("error = %v, want working-directory error", err)
+	}
+}
+
+func TestWriteReportFormatsSuccess(t *testing.T) {
+	var out bytes.Buffer
+	doctor.WriteReport(&out, doctor.Report{
+		AdapterName:     "test-adapter",
+		Binary:          "agent",
+		ResolvedCommand: "/usr/bin/agent",
+		WorkDir:         "/tmp/project",
+		VersionArgs:     []string{"--version"},
+		VersionStdout:   "agent 1.2.3\n",
+		Environment: []doctor.EnvStatus{{
+			Name:      "AGENT_API_KEY",
+			Present:   true,
+			Required:  true,
+			Sensitive: true,
+		}},
+	}, nil)
+
+	want := strings.Join([]string{
+		"test-adapter doctor: ok",
+		"binary: agent",
+		"resolved: /usr/bin/agent",
+		"workdir: /tmp/project",
+		"version args: --version",
+		"env AGENT_API_KEY: present (redacted) (required)",
+		"stdout:",
+		"agent 1.2.3",
+		"",
+	}, "\n")
+	if got := out.String(); got != want {
+		t.Fatalf("report = %q, want %q", got, want)
+	}
+}
+
+func TestWriteReportFormatsFailureAndTruncation(t *testing.T) {
+	var out bytes.Buffer
+	doctor.WriteReport(&out, doctor.Report{
+		AdapterName:     "test-adapter",
+		Binary:          "agent",
+		VersionArgs:     []string{"--version"},
+		VersionStderr:   "bad\n",
+		StderrTruncated: true,
+	}, errors.New("boom"))
+
+	want := strings.Join([]string{
+		"test-adapter doctor: failed",
+		"binary: agent",
+		"version args: --version",
+		"stderr (truncated):",
+		"bad",
+		"",
+	}, "\n")
+	if got := out.String(); got != want {
+		t.Fatalf("report = %q, want %q", got, want)
 	}
 }
 

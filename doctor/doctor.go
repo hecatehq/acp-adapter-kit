@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -93,6 +94,56 @@ func Run(ctx context.Context, spec Spec) (Report, error) {
 		return report, fmt.Errorf("run version probe: %w", err)
 	}
 	return report, nil
+}
+
+func WriteReport(w io.Writer, report Report, runErr error) {
+	status := "ok"
+	if runErr != nil {
+		status = "failed"
+	}
+	_, _ = fmt.Fprintf(w, "%s doctor: %s\n", report.AdapterName, status)
+	_, _ = fmt.Fprintf(w, "binary: %s\n", report.Binary)
+	if report.ResolvedCommand != "" {
+		_, _ = fmt.Fprintf(w, "resolved: %s\n", report.ResolvedCommand)
+	}
+	if report.WorkDir != "" {
+		_, _ = fmt.Fprintf(w, "workdir: %s\n", report.WorkDir)
+	}
+	if len(report.VersionArgs) != 0 {
+		_, _ = fmt.Fprintf(w, "version args: %s\n", strings.Join(report.VersionArgs, " "))
+	}
+	for _, status := range report.Environment {
+		state := "missing"
+		if status.Present {
+			state = "present"
+		}
+		suffix := ""
+		if status.Sensitive {
+			suffix = " (redacted)"
+		}
+		if status.Required {
+			suffix += " (required)"
+		}
+		_, _ = fmt.Fprintf(w, "env %s: %s%s\n", status.Name, state, suffix)
+	}
+	writeProbeOutput(w, "stdout", report.VersionStdout, report.StdoutTruncated)
+	writeProbeOutput(w, "stderr", report.VersionStderr, report.StderrTruncated)
+}
+
+func writeProbeOutput(w io.Writer, label string, output string, truncated bool) {
+	if output == "" && !truncated {
+		return
+	}
+	output = strings.TrimRight(output, "\n")
+	suffix := ""
+	if truncated {
+		suffix = " (truncated)"
+	}
+	if output == "" {
+		_, _ = fmt.Fprintf(w, "%s%s:\n", label, suffix)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s%s:\n%s\n", label, suffix, output)
 }
 
 func withDefaults(spec Spec) Spec {
