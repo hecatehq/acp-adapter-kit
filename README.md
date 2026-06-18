@@ -9,6 +9,7 @@ This module intentionally contains provider-neutral pieces only:
 - ACP runtime request/result helpers;
 - runtime bridge and host scaffolding;
 - process launching and bounded output capture;
+- provider-neutral doctor command runner support;
 - fake runtime and protocol test utilities.
 
 Adapter repositories should keep provider-specific behavior local, including
@@ -22,4 +23,3 @@ Run the kit test suite with:
 ```sh
 go test ./...
 ```
-
