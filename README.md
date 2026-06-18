@@ -5,6 +5,7 @@ Go building blocks for ACP adapters that wrap external coding-agent CLIs.
 This module intentionally contains provider-neutral pieces only:
 
 - local ACP JSON-RPC server transport;
+- provider-neutral Cobra command scaffolding for ACP adapters;
 - runtime JSON-RPC client and cancellation plumbing;
 - ACP runtime request/result helpers;
 - runtime bridge and host scaffolding;
@@ -13,8 +14,8 @@ This module intentionally contains provider-neutral pieces only:
 - fake runtime and protocol test utilities.
 
 Adapter repositories should keep provider-specific behavior local, including
-binary names, environment allowlists, doctor wording, launch defaults, README
-copy, release workflows, and vendor-specific ACP quirks.
+binary names, capabilities, environment allowlists, doctor wording, launch
+defaults, README copy, release workflows, and vendor-specific ACP quirks.
 
 ## Verification
 
