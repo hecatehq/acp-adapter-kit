@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
+	"github.com/hecatehq/acp-adapter-kit/commandbridge"
 	"github.com/hecatehq/acp-adapter-kit/doctor"
 	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
 	"github.com/hecatehq/acp-adapter-kit/runtimebridge"
@@ -21,6 +22,7 @@ type Spec struct {
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Runtime RuntimeSpec
+	Command *commandbridge.Spec
 	Doctor  *DoctorSpec
 }
 
@@ -92,6 +94,8 @@ func NewRootCommand(spec Spec) *cobra.Command {
 					[]acp.Option{acp.WithInitializeHandler(host.Initialize)},
 					runtimebridge.New(host).Options()...,
 				)
+			} else if spec.Command != nil {
+				opts = append(opts, commandbridge.New(*spec.Command).Options()...)
 			}
 			server := acp.NewServer(info, opts...)
 			if err := server.Serve(spec.Stdin, stdout); err != nil {
