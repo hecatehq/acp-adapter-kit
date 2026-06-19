@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +71,51 @@ func TestLauncherLaunchesRuntimeProcess(t *testing.T) {
 	}
 	if !strings.Contains(out, "STDIN=prompt text") {
 		t.Fatalf("stdout = %q, want stdin", out)
+	}
+}
+
+func TestLauncherUsesSpecBinaryAndClonesConfigArgs(t *testing.T) {
+	t.Setenv("GO_WANT_RUNTIMEPROC_HELPER", "1")
+	configArgs := []string{"-test.run=TestRuntimeProcHelper", "--", "stream", "base-arg"}
+	defaultBinary := filepath.Join(t.TempDir(), "unused-default-runtime")
+	launcher := runtimeproc.NewLauncher(runtimeproc.Config{
+		Binary:     defaultBinary,
+		Args:       configArgs,
+		InheritEnv: []string{"GO_WANT_RUNTIMEPROC_HELPER"},
+	})
+	configArgs[len(configArgs)-1] = "mutated-after-construction"
+
+	proc, err := launcher.Launch(context.Background(), runtimeproc.LaunchSpec{
+		Binary:  os.Args[0],
+		Args:    []string{"session-arg"},
+		WorkDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Launch returned error: %v", err)
+	}
+	if _, err := io.WriteString(proc.Stdin, "prompt text"); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	if err := proc.Stdin.Close(); err != nil {
+		t.Fatalf("close stdin: %v", err)
+	}
+	stdout, err := io.ReadAll(proc.Stdout)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if err := proc.Wait(); err != nil {
+		t.Fatalf("Wait returned error: %v; stderr=%s", err, proc.Stderr())
+	}
+
+	out := string(stdout)
+	if !strings.Contains(out, "ARGS=base-arg,session-arg") {
+		t.Fatalf("stdout = %q, want cloned config args plus session args", out)
+	}
+	if strings.Contains(out, "mutated-after-construction") {
+		t.Fatalf("stdout = %q, launcher retained caller-owned config args", out)
+	}
+	if proc.Command != filepath.Clean(os.Args[0]) {
+		t.Fatalf("process command = %q, want LaunchSpec binary override %q", proc.Command, filepath.Clean(os.Args[0]))
 	}
 }
 
