@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
 	adapterprocess "github.com/hecatehq/acp-adapter-kit/process"
@@ -50,6 +52,7 @@ type Spec struct {
 	MaxTranscriptExchanges int
 	BuildPrompt            PromptCommandBuilder
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
+	Now                    func() time.Time
 }
 
 type Bridge struct {
@@ -69,6 +72,9 @@ type Session struct {
 	MCPServers            []runtimeacp.MCPServer
 	Config                map[string]string
 	ModeID                string
+	Title                 string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 type SelectConfigOption struct {
@@ -145,12 +151,15 @@ func (b *Bridge) newSession(ctx *acp.MethodContext, params json.RawMessage) (any
 		return nil, rpcErr
 	}
 	id := b.newID()
+	now := b.now()
 	state := &sessionState{Session: Session{
 		ID:                    id,
 		CWD:                   strings.TrimSpace(req.CWD),
 		AdditionalDirectories: cloneStrings(req.AdditionalDirectories),
 		MCPServers:            cloneMCPServers(req.MCPServers),
 		Config:                defaultConfig(b.spec.Options),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}}
 	b.mu.Lock()
 	b.sessions[id] = state
@@ -174,6 +183,7 @@ func (b *Bridge) forkSession(ctx *acp.MethodContext, params json.RawMessage) (an
 		return nil, rpcErr
 	}
 	id := b.newID()
+	now := b.now()
 	state := &sessionState{Session: Session{
 		ID:                    id,
 		CWD:                   strings.TrimSpace(firstNonEmpty(req.CWD, source.CWD)),
@@ -181,6 +191,9 @@ func (b *Bridge) forkSession(ctx *acp.MethodContext, params json.RawMessage) (an
 		MCPServers:            cloneMCPServers(firstNonNil(req.MCPServers, source.MCPServers)),
 		Config:                cloneStringMap(source.Config),
 		ModeID:                source.ModeID,
+		Title:                 source.Title,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}}
 	state.transcript = cloneTranscript(source.transcript)
 	b.mu.Lock()
@@ -225,39 +238,74 @@ func (b *Bridge) resumeSession(ctx *acp.MethodContext, params json.RawMessage) (
 	return map[string]any{"configOptions": b.configOptions(state)}, nil
 }
 
-func (b *Bridge) listSessions(_ *acp.MethodContext, _ json.RawMessage) (any, *acp.RPCError) {
+func (b *Bridge) listSessions(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req runtimeacp.ListSessionsParams
+	if len(params) != 0 && string(params) != "null" {
+		if rpcErr := decodeParams(params, &req); rpcErr != nil {
+			return nil, rpcErr
+		}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	sessions := make([]map[string]any, 0, len(b.sessions))
 	for _, state := range b.sessions {
-		sessions = append(sessions, map[string]any{
+		if req.CWD != "" && state.CWD != req.CWD {
+			continue
+		}
+		item := map[string]any{
 			"sessionId": state.ID,
 			"cwd":       state.CWD,
-		})
+		}
+		if len(state.AdditionalDirectories) != 0 {
+			item["additionalDirectories"] = cloneStrings(state.AdditionalDirectories)
+		}
+		if title := strings.TrimSpace(state.Title); title != "" {
+			item["title"] = title
+		}
+		if !state.UpdatedAt.IsZero() {
+			item["updatedAt"] = state.UpdatedAt.UTC().Format(time.RFC3339Nano)
+		}
+		sessions = append(sessions, item)
 	}
+	sort.Slice(sessions, func(i, j int) bool {
+		left, _ := sessions[i]["updatedAt"].(string)
+		right, _ := sessions[j]["updatedAt"].(string)
+		if left != right {
+			return left > right
+		}
+		return fmt.Sprint(sessions[i]["sessionId"]) < fmt.Sprint(sessions[j]["sessionId"])
+	})
 	return map[string]any{"sessions": sessions}, nil
 }
 
-func (b *Bridge) setConfigOption(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+func (b *Bridge) setConfigOption(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
 	req, rpcErr := decodeSetConfigOption(params)
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	state := b.sessions[req.SessionID]
 	if state == nil {
+		b.mu.Unlock()
 		return nil, notFound("session not found", req.SessionID)
 	}
 	option, ok := b.selectOption(req.ConfigID)
 	if !ok {
+		b.mu.Unlock()
 		return nil, invalidParams("unknown config option", req.ConfigID)
 	}
 	if !selectOptionAllows(option, req.Value) {
+		b.mu.Unlock()
 		return nil, invalidParams("unsupported config value", req.Value)
 	}
 	state.Config[req.ConfigID] = req.Value
-	return map[string]any{"configOptions": b.configOptions(state)}, nil
+	state.UpdatedAt = b.now()
+	configOptions := b.configOptions(state)
+	b.mu.Unlock()
+	if err := notifyConfigOptions(ctx, req.SessionID, configOptions); err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "config option notification failed", Data: err.Error()}
+	}
+	return map[string]any{"configOptions": configOptions}, nil
 }
 
 func (b *Bridge) setMode(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
@@ -272,6 +320,7 @@ func (b *Bridge) setMode(_ *acp.MethodContext, params json.RawMessage) (any, *ac
 		return nil, notFound("session not found", req.SessionID)
 	}
 	state.ModeID = req.ModeID
+	state.UpdatedAt = b.now()
 	return map[string]any{}, nil
 }
 
@@ -400,6 +449,10 @@ func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText str
 	if state == nil {
 		return
 	}
+	if state.Title == "" {
+		state.Title = sessionTitle(userText)
+	}
+	state.UpdatedAt = b.now()
 	state.transcript = append(state.transcript, transcriptExchange{
 		User:      userText,
 		Assistant: assistantText,
@@ -407,6 +460,14 @@ func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText str
 	if max := b.maxTranscriptExchanges(); max > 0 && len(state.transcript) > max {
 		state.transcript = append([]transcriptExchange(nil), state.transcript[len(state.transcript)-max:]...)
 	}
+}
+
+func sessionTitle(text string) string {
+	title := strings.Join(strings.Fields(text), " ")
+	if len(title) > 80 {
+		return title[:80] + "..."
+	}
+	return title
 }
 
 func (b *Bridge) maxTranscriptExchanges() int {
@@ -501,6 +562,16 @@ func notifyStreamEvents(ctx *acp.MethodContext, sessionID string, events []Strea
 		}
 	}
 	return nil
+}
+
+func notifyConfigOptions(ctx *acp.MethodContext, sessionID string, configOptions []map[string]any) error {
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update": map[string]any{
+			"sessionUpdate": "config_option_update",
+			"configOptions": configOptions,
+		},
+	})
 }
 
 func (b *Bridge) newToolCallID() string {
@@ -733,6 +804,13 @@ func (b *Bridge) newID() string {
 		return b.spec.NewID()
 	}
 	return fmt.Sprintf("session-%d", b.nextID.Add(1))
+}
+
+func (b *Bridge) now() time.Time {
+	if b.spec.Now != nil {
+		return b.spec.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (b *Bridge) selectOption(id string) (SelectConfigOption, bool) {

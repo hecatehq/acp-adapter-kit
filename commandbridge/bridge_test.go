@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
 	"github.com/hecatehq/acp-adapter-kit/acptest"
@@ -70,11 +71,13 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 		t.Fatalf("config options = %#v, want default model selector", session.ConfigOptions)
 	}
 
-	updated := client.Request("session/set_config_option", map[string]any{
-		"sessionId": "session-1",
-		"configId":  "model",
-		"value":     "smart",
-	})
+	configUpdate, updated := setConfigOption(t, client, "session-1", "model", "smart")
+	if configUpdate.SessionID != "session-1" ||
+		configUpdate.Update.SessionUpdate != "config_option_update" ||
+		len(configUpdate.Update.ConfigOptions) != 1 ||
+		configUpdate.Update.ConfigOptions[0].CurrentValue != "smart" {
+		t.Fatalf("config update = %#v, want smart config option notification", configUpdate)
+	}
 	var setResult struct {
 		ConfigOptions []struct {
 			ID           string `json:"id"`
@@ -375,11 +378,7 @@ func TestBridgeLoadSessionRebindsWorkspaceAndKeepsConfig(t *testing.T) {
 	})
 	client := acptest.NewClient(t, server(bridge))
 	client.Request("session/new", map[string]any{"cwd": "/tmp/original"})
-	client.Request("session/set_config_option", map[string]any{
-		"sessionId": "session-1",
-		"configId":  "model",
-		"value":     "smart",
-	})
+	setConfigOption(t, client, "session-1", "model", "smart")
 
 	loaded := client.Request("session/load", map[string]any{
 		"sessionId":             "session-1",
@@ -457,11 +456,7 @@ func TestBridgeForkSessionClonesConfigAndSeparatesState(t *testing.T) {
 	})
 	client := acptest.NewClient(t, server(bridge))
 	client.Request("session/new", map[string]any{"cwd": "/tmp/source"})
-	client.Request("session/set_config_option", map[string]any{
-		"sessionId": "source",
-		"configId":  "model",
-		"value":     "smart",
-	})
+	setConfigOption(t, client, "source", "model", "smart")
 
 	forked := client.Request("session/fork", map[string]any{
 		"sessionId": "source",
@@ -479,11 +474,7 @@ func TestBridgeForkSessionClonesConfigAndSeparatesState(t *testing.T) {
 		t.Fatalf("fork result = %#v, want fork with cloned smart config", forkResult)
 	}
 
-	client.Request("session/set_config_option", map[string]any{
-		"sessionId": "fork",
-		"configId":  "model",
-		"value":     "default",
-	})
+	setConfigOption(t, client, "fork", "model", "default")
 	sourceResponses := client.Send(promptRequest(5, "source", "hello"))
 	sourceChunk := decodeAgentChunk(t, sourceResponses[1])
 	if sourceChunk.Update.Content.Text != "source|smart|hello@/tmp/source" {
@@ -538,6 +529,76 @@ func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
 	loadCommands := decodeAvailableCommands(t, loadResponses[0])
 	if loadCommands.SessionID != "session-1" || len(loadCommands.Update.AvailableCommands) != 2 {
 		t.Fatalf("load commands = %#v, want command replay", loadCommands)
+	}
+}
+
+func TestBridgeListSessionsReturnsMetadataAndFiltersByWorkspace(t *testing.T) {
+	base := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	ticks := 0
+	nextID := 0
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string {
+			nextID++
+			return []string{"session-a", "session-b"}[nextID-1]
+		},
+		Now: func() time.Time {
+			ticks++
+			return base.Add(time.Duration(ticks) * time.Minute)
+		},
+		IncludeTranscript: true,
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("done")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{
+		"cwd":                   "/tmp/a",
+		"additionalDirectories": []string{"/tmp/shared"},
+	})
+	client.Send(promptRequest(2, "session-a", "Implement the command-backed metadata contract with a long enough title to trim eventually"))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/b"})
+
+	all := client.Request("session/list", map[string]any{})
+	var allResult struct {
+		Sessions []struct {
+			SessionID             string   `json:"sessionId"`
+			CWD                   string   `json:"cwd"`
+			AdditionalDirectories []string `json:"additionalDirectories"`
+			Title                 string   `json:"title"`
+			UpdatedAt             string   `json:"updatedAt"`
+		} `json:"sessions"`
+	}
+	all.ResultInto(t, &allResult)
+	if len(allResult.Sessions) != 2 || allResult.Sessions[0].SessionID != "session-b" || allResult.Sessions[1].SessionID != "session-a" {
+		t.Fatalf("all sessions = %#v, want newest first", allResult.Sessions)
+	}
+
+	filtered := client.Request("session/list", map[string]any{"cwd": "/tmp/a"})
+	var filteredResult struct {
+		Sessions []struct {
+			SessionID             string   `json:"sessionId"`
+			CWD                   string   `json:"cwd"`
+			AdditionalDirectories []string `json:"additionalDirectories"`
+			Title                 string   `json:"title"`
+			UpdatedAt             string   `json:"updatedAt"`
+		} `json:"sessions"`
+	}
+	filtered.ResultInto(t, &filteredResult)
+	if len(filteredResult.Sessions) != 1 ||
+		filteredResult.Sessions[0].SessionID != "session-a" ||
+		filteredResult.Sessions[0].CWD != "/tmp/a" ||
+		len(filteredResult.Sessions[0].AdditionalDirectories) != 1 ||
+		filteredResult.Sessions[0].AdditionalDirectories[0] != "/tmp/shared" ||
+		!strings.HasPrefix(filteredResult.Sessions[0].Title, "Implement the command-backed metadata contract") ||
+		filteredResult.Sessions[0].UpdatedAt != base.Add(2*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("filtered sessions = %#v, want session-a metadata", filteredResult.Sessions)
 	}
 }
 
@@ -707,6 +768,24 @@ func promptRequest(id int, sessionID, prompt string) map[string]any {
 	}
 }
 
+func setConfigOption(t testing.TB, client *acptest.Client, sessionID, configID, value string) (configOptionsUpdate, acptest.Response) {
+	t.Helper()
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "set-config-" + configID,
+		"method":  "session/set_config_option",
+		"params": map[string]any{
+			"sessionId": sessionID,
+			"configId":  configID,
+			"value":     value,
+		},
+	})
+	if len(responses) != 2 {
+		t.Fatalf("set_config_option responses = %#v, want config update + response", responses)
+	}
+	return decodeConfigOptionsUpdate(t, responses[0]), responses[1]
+}
+
 type streamingRunnerFunc func(context.Context, adapterprocess.Spec, func([]byte) error) (adapterprocess.Result, error)
 
 func (f streamingRunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
@@ -803,6 +882,30 @@ type availableCommandsUpdate struct {
 			} `json:"input"`
 		} `json:"availableCommands"`
 	} `json:"update"`
+}
+
+type configOptionsUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		ConfigOptions []struct {
+			ID           string `json:"id"`
+			CurrentValue string `json:"currentValue"`
+		} `json:"configOptions"`
+	} `json:"update"`
+}
+
+func decodeConfigOptionsUpdate(t testing.TB, response acptest.Response) configOptionsUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update configOptionsUpdate
+	response.ParamsInto(t, &update)
+	if update.Update.SessionUpdate != "config_option_update" {
+		t.Fatalf("session update = %q, want config_option_update", update.Update.SessionUpdate)
+	}
+	return update
 }
 
 func decodeAvailableCommands(t testing.TB, response acptest.Response) availableCommandsUpdate {
