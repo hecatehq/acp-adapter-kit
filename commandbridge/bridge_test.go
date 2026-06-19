@@ -273,8 +273,8 @@ func TestBridgeParsesStructuredStreamIntoACPUpdates(t *testing.T) {
 	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
 
 	responses := client.Send(promptRequest(2, "session-1", "first"))
-	if len(responses) != 8 {
-		t.Fatalf("got %d responses, want command start + 5 parsed updates + command finish + prompt response: %#v", len(responses), responses)
+	if len(responses) != 9 {
+		t.Fatalf("got %d responses, want command start + 5 parsed updates + command finish + session info + prompt response: %#v", len(responses), responses)
 	}
 	start := decodeCommandToolUpdate(t, responses[0])
 	if start.Update.SessionUpdate != "tool_call" || start.Update.Title != "Run agent" {
@@ -311,12 +311,56 @@ func TestBridgeParsesStructuredStreamIntoACPUpdates(t *testing.T) {
 	if finish.Update.SessionUpdate != "tool_call_update" || finish.Update.ToolCallID != start.Update.ToolCallID {
 		t.Fatalf("finish = %#v, want outer command finish", finish)
 	}
+	info := decodeSessionInfoUpdate(t, responses[7])
+	if info.SessionID != "session-1" ||
+		info.Update.SessionUpdate != "session_info_update" ||
+		info.Update.Title != "first" ||
+		info.Update.UpdatedAt == "" {
+		t.Fatalf("session info = %#v, want title + updated timestamp", info)
+	}
 
 	client.Send(promptRequest(3, "session-1", "second"))
 	if len(prompts) != 2 ||
 		!strings.Contains(prompts[1], "Assistant:\ndone") ||
 		strings.Contains(prompts[1], `{"type":"message"`) {
 		t.Fatalf("second prompt = %q, want cleaned transcript prelude", prompts[1])
+	}
+}
+
+func TestBridgePublishesSessionInfoAfterTranscriptPrompt(t *testing.T) {
+	base := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	ticks := 0
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:             func() string { return "session-1" },
+		IncludeTranscript: true,
+		Now: func() time.Time {
+			ticks++
+			return base.Add(time.Duration(ticks) * time.Second)
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("done")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "Use metadata updates so ACP hosts can show a useful command-backed session title"))
+	if len(responses) != 5 {
+		t.Fatalf("responses = %#v, want prompt lifecycle + session info", responses)
+	}
+	info := decodeSessionInfoUpdate(t, responses[3])
+	if info.SessionID != "session-1" ||
+		info.Update.SessionUpdate != "session_info_update" ||
+		!strings.HasPrefix(info.Update.Title, "Use metadata updates so ACP hosts") ||
+		info.Update.UpdatedAt != base.Add(2*time.Second).Format(time.RFC3339Nano) {
+		t.Fatalf("session info = %#v, want transcript metadata", info)
 	}
 }
 
@@ -895,6 +939,15 @@ type configOptionsUpdate struct {
 	} `json:"update"`
 }
 
+type sessionInfoUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		Title         string `json:"title"`
+		UpdatedAt     string `json:"updatedAt"`
+	} `json:"update"`
+}
+
 func decodeConfigOptionsUpdate(t testing.TB, response acptest.Response) configOptionsUpdate {
 	t.Helper()
 	if response.Method != "session/update" {
@@ -904,6 +957,19 @@ func decodeConfigOptionsUpdate(t testing.TB, response acptest.Response) configOp
 	response.ParamsInto(t, &update)
 	if update.Update.SessionUpdate != "config_option_update" {
 		t.Fatalf("session update = %q, want config_option_update", update.Update.SessionUpdate)
+	}
+	return update
+}
+
+func decodeSessionInfoUpdate(t testing.TB, response acptest.Response) sessionInfoUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update sessionInfoUpdate
+	response.ParamsInto(t, &update)
+	if update.Update.SessionUpdate != "session_info_update" {
+		t.Fatalf("session update = %q, want session_info_update", update.Update.SessionUpdate)
 	}
 	return update
 }

@@ -108,6 +108,11 @@ type transcriptExchange struct {
 	Assistant string
 }
 
+type sessionInfo struct {
+	Title     string
+	UpdatedAt time.Time
+}
+
 const (
 	defaultMaxTranscriptExchanges = 8
 	toolOutputPreviewLimit        = 8 * 1024
@@ -357,7 +362,11 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
-	b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText)
+	if info, ok := b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText); ok {
+		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
+			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
+		}
+	}
 	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
 }
 
@@ -434,20 +443,20 @@ func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.Prom
 	return out
 }
 
-func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText string) {
+func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText string) (sessionInfo, bool) {
 	if !b.spec.IncludeTranscript {
-		return
+		return sessionInfo{}, false
 	}
 	userText = strings.TrimSpace(userText)
 	assistantText = strings.TrimSpace(assistantText)
 	if userText == "" && assistantText == "" {
-		return
+		return sessionInfo{}, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	state := b.sessions[sessionID]
 	if state == nil {
-		return
+		return sessionInfo{}, false
 	}
 	if state.Title == "" {
 		state.Title = sessionTitle(userText)
@@ -460,6 +469,7 @@ func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText str
 	if max := b.maxTranscriptExchanges(); max > 0 && len(state.transcript) > max {
 		state.transcript = append([]transcriptExchange(nil), state.transcript[len(state.transcript)-max:]...)
 	}
+	return sessionInfo{Title: state.Title, UpdatedAt: state.UpdatedAt}, true
 }
 
 func sessionTitle(text string) string {
@@ -571,6 +581,22 @@ func notifyConfigOptions(ctx *acp.MethodContext, sessionID string, configOptions
 			"sessionUpdate": "config_option_update",
 			"configOptions": configOptions,
 		},
+	})
+}
+
+func notifySessionInfo(ctx *acp.MethodContext, sessionID string, info sessionInfo) error {
+	update := map[string]any{
+		"sessionUpdate": "session_info_update",
+	}
+	if title := strings.TrimSpace(info.Title); title != "" {
+		update["title"] = title
+	}
+	if !info.UpdatedAt.IsZero() {
+		update["updatedAt"] = info.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update":    update,
 	})
 }
 

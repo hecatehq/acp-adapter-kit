@@ -33,9 +33,10 @@ Adapters have two runtime integration paths:
   ACP `session/cancel` arrives, supporting in-memory `session/load`,
   `session/resume`, and `session/fork`, returning command-backed session list
   metadata, publishing `config_option_update` notifications after config
-  changes, translating structured command streams into ACP updates when a
-  parser is configured, and optionally prepending a bounded transcript prelude
-  to later prompt commands.
+  changes, publishing `session_info_update` notifications when transcript
+  metadata changes, translating structured command streams into ACP updates
+  when a parser is configured, and optionally prepending a bounded transcript
+  prelude to later prompt commands.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.
