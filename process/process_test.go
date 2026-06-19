@@ -125,6 +125,51 @@ func TestOutputLimits(t *testing.T) {
 	}
 }
 
+func TestRunStreamEmitsStdoutAndCapturesResult(t *testing.T) {
+	command, args := helperCommand("chunks")
+	var streamed strings.Builder
+	result, err := adapterprocess.RunStream(context.Background(), adapterprocess.Spec{
+		Command:     command,
+		Args:        args,
+		Dir:         t.TempDir(),
+		Env:         adapterprocess.EnvPolicy{Set: map[string]string{"GO_WANT_PROCESS_HELPER": "1"}},
+		StdoutLimit: 1024,
+		StderrLimit: 1024,
+	}, func(chunk []byte) error {
+		streamed.Write(chunk)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunStream returned error: %v; stderr=%s", err, result.Stderr)
+	}
+	if got, want := string(result.Stdout), "first chunk\nsecond chunk\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if streamed.String() != string(result.Stdout) {
+		t.Fatalf("streamed = %q, want captured stdout %q", streamed.String(), result.Stdout)
+	}
+}
+
+func TestRunStreamCallbackErrorFailsRun(t *testing.T) {
+	command, args := helperCommand("chunks")
+	result, err := adapterprocess.RunStream(context.Background(), adapterprocess.Spec{
+		Command:     command,
+		Args:        args,
+		Dir:         t.TempDir(),
+		Env:         adapterprocess.EnvPolicy{Set: map[string]string{"GO_WANT_PROCESS_HELPER": "1"}},
+		StdoutLimit: 1024,
+		StderrLimit: 1024,
+	}, func([]byte) error {
+		return errors.New("client closed")
+	})
+	if err == nil || !strings.Contains(err.Error(), "client closed") {
+		t.Fatalf("RunStream error = %v, want callback error", err)
+	}
+	if len(result.Stdout) == 0 {
+		t.Fatalf("stdout = %q, want captured bytes before callback failure", result.Stdout)
+	}
+}
+
 func TestNonZeroExitReturnsExitError(t *testing.T) {
 	command, args := helperCommand("exit")
 	result, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
@@ -314,6 +359,10 @@ func TestProcessHelper(t *testing.T) {
 	case "output":
 		fmt.Fprint(os.Stdout, strings.Repeat("o", 64))
 		fmt.Fprint(os.Stderr, strings.Repeat("e", 64))
+	case "chunks":
+		fmt.Fprint(os.Stdout, "first chunk\n")
+		time.Sleep(10 * time.Millisecond)
+		fmt.Fprint(os.Stdout, "second chunk\n")
 	case "exit":
 		fmt.Fprint(os.Stderr, "boom")
 		os.Exit(7)

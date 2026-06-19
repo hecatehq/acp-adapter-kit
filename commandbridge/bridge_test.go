@@ -130,6 +130,75 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 	}
 }
 
+func TestBridgeStreamsPromptCommandOutputChunks(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			if spec.Command != "agent" || strings.Join(spec.Args, " ") != "hello" || spec.Dir != "/tmp/work" {
+				t.Fatalf("process spec = %#v, want prompt command", spec)
+			}
+			if err := onStdout([]byte("hello ")); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			if err := onStdout([]byte("stream")); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			return adapterprocess.Result{Stdout: []byte("hello stream")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt":    []map[string]any{{"type": "text", "text": "hello"}},
+		},
+	})
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want two chunks + prompt response: %#v", len(responses), responses)
+	}
+	for i, want := range []string{"hello ", "stream"} {
+		if responses[i].Method != "session/update" {
+			t.Fatalf("response %d method = %q, want session/update", i, responses[i].Method)
+		}
+		var update struct {
+			SessionID string `json:"sessionId"`
+			Update    struct {
+				SessionUpdate string `json:"sessionUpdate"`
+				Content       struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"update"`
+		}
+		responses[i].ParamsInto(t, &update)
+		if update.SessionID != "session-1" ||
+			update.Update.SessionUpdate != "agent_message_chunk" ||
+			update.Update.Content.Type != "text" ||
+			update.Update.Content.Text != want {
+			t.Fatalf("chunk %d update = %#v, want %q", i, update, want)
+		}
+	}
+	var promptResult struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[2].ResultInto(t, &promptResult)
+	if promptResult.StopReason != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn", promptResult.StopReason)
+	}
+}
+
 func TestBridgeRejectsUnsupportedConfigValue(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
@@ -232,4 +301,14 @@ func server(bridge *commandbridge.Bridge) *acp.Server {
 		Name:  "test-command-adapter",
 		Title: "Test Command Adapter",
 	}, bridge.Options()...)
+}
+
+type streamingRunnerFunc func(context.Context, adapterprocess.Spec, func([]byte) error) (adapterprocess.Result, error)
+
+func (f streamingRunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+	return adapterprocess.Result{}, errors.New("buffered Run should not be called")
+}
+
+func (f streamingRunnerFunc) RunStream(ctx context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+	return f(ctx, spec, onStdout)
 }

@@ -18,6 +18,10 @@ type Runner interface {
 	Run(context.Context, adapterprocess.Spec) (adapterprocess.Result, error)
 }
 
+type StreamRunner interface {
+	RunStream(context.Context, adapterprocess.Spec, func([]byte) error) (adapterprocess.Result, error)
+}
+
 type RunnerFunc func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error)
 
 func (f RunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
@@ -28,6 +32,10 @@ type ProcessRunner struct{}
 
 func (ProcessRunner) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
 	return adapterprocess.Run(ctx, spec)
+}
+
+func (ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+	return adapterprocess.RunStream(ctx, spec, onStdout)
 }
 
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
@@ -201,29 +209,46 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if err != nil {
 		return nil, invalidParams("build prompt command", err.Error())
 	}
-	result, err := b.spec.Runner.Run(runCtx, command)
+	result, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
+	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
+}
+
+func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec) (adapterprocess.Result, error) {
+	if runner, ok := b.spec.Runner.(StreamRunner); ok {
+		return runner.RunStream(runCtx, command, func(chunk []byte) error {
+			return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
+		})
+	}
+	result, err := b.spec.Runner.Run(runCtx, command)
 	text := strings.TrimSpace(string(result.Stdout))
 	if text != "" {
-		if err := ctx.Notify("session/update", map[string]any{
-			"sessionId": req.SessionID,
-			"update": map[string]any{
-				"sessionUpdate": "agent_message_chunk",
-				"content": map[string]any{
-					"type": "text",
-					"text": text,
-				},
-			},
-		}); err != nil {
-			return nil, &acp.RPCError{Code: -32000, Message: "notification failed", Data: err.Error()}
+		if notifyErr := notifyAgentMessageChunk(methodCtx, sessionID, text); notifyErr != nil && err == nil {
+			err = fmt.Errorf("notification failed: %w", notifyErr)
 		}
 	}
-	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
+	return result, err
+}
+
+func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text string) error {
+	if text == "" {
+		return nil
+	}
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update": map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"content": map[string]any{
+				"type": "text",
+				"text": text,
+			},
+		},
+	})
 }
 
 func (b *Bridge) cancelMethod(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {

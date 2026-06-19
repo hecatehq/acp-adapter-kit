@@ -144,6 +144,68 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	return result, fmt.Errorf("run process %q: %w", resolved, err)
 }
 
+func RunStream(ctx context.Context, spec Spec, onStdout func([]byte) error) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	resolved, err := ResolveCommand(spec.Command)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := validateArgs(spec.Args); err != nil {
+		return Result{}, err
+	}
+	dir, err := CleanWorkingDir(spec.Dir)
+	if err != nil {
+		return Result{}, err
+	}
+	env, err := BuildEnv(os.Environ(), spec.Env)
+	if err != nil {
+		return Result{}, err
+	}
+
+	stdout := &streamingBuffer{
+		buffer: newLimitedBuffer(limitOrDefault(spec.StdoutLimit)),
+		stream: onStdout,
+	}
+	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
+
+	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	runErr := cmd.Run()
+	result := Result{
+		Command:         resolved,
+		Args:            append([]string(nil), spec.Args...),
+		Dir:             dir,
+		Stdout:          stdout.Bytes(),
+		Stderr:          stderr.Bytes(),
+		StdoutTruncated: stdout.Truncated(),
+		StderrTruncated: stderr.Truncated(),
+	}
+	if ctx.Err() != nil {
+		return result, fmt.Errorf("process cancelled: %w", ctx.Err())
+	}
+	if streamErr := stdout.StreamError(); streamErr != nil {
+		return result, fmt.Errorf("stream process stdout: %w", streamErr)
+	}
+	if runErr == nil {
+		return result, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return result, &ExitError{Command: resolved, Code: exitErr.ExitCode(), Stderr: result.Stderr}
+	}
+	if os.IsNotExist(runErr) {
+		return result, &CommandNotFoundError{Command: spec.Command, Err: runErr}
+	}
+	return result, fmt.Errorf("run process %q: %w", resolved, runErr)
+}
+
 func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -478,4 +540,55 @@ func (b *limitedBuffer) Truncated() bool {
 	defer b.mu.Unlock()
 
 	return b.truncated
+}
+
+type streamingBuffer struct {
+	buffer *limitedBuffer
+	stream func([]byte) error
+
+	mu  sync.Mutex
+	err error
+}
+
+func (b *streamingBuffer) Write(p []byte) (int, error) {
+	if b == nil || b.buffer == nil {
+		return len(p), nil
+	}
+	_, _ = b.buffer.Write(p)
+	if len(p) == 0 || b.stream == nil {
+		return len(p), nil
+	}
+	chunk := append([]byte(nil), p...)
+	if err := b.stream(chunk); err != nil {
+		b.mu.Lock()
+		if b.err == nil {
+			b.err = err
+		}
+		b.mu.Unlock()
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (b *streamingBuffer) Bytes() []byte {
+	if b == nil || b.buffer == nil {
+		return nil
+	}
+	return b.buffer.Bytes()
+}
+
+func (b *streamingBuffer) Truncated() bool {
+	if b == nil || b.buffer == nil {
+		return false
+	}
+	return b.buffer.Truncated()
+}
+
+func (b *streamingBuffer) StreamError() error {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err
 }
