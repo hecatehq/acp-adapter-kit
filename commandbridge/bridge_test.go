@@ -208,6 +208,115 @@ func TestBridgeStreamsPromptCommandOutputChunks(t *testing.T) {
 	}
 }
 
+func TestBridgeParsesStructuredStreamIntoACPUpdates(t *testing.T) {
+	var prompts []string
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:             func() string { return "session-1" },
+		IncludeTranscript: true,
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				switch event["type"] {
+				case "message":
+					text, _ := event["text"].(string)
+					return commandbridge.JSONLMapping{
+						Events:         []commandbridge.StreamEvent{commandbridge.AgentMessageChunk(text)},
+						TranscriptText: text,
+					}, nil
+				case "thought":
+					text, _ := event["text"].(string)
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{commandbridge.AgentThoughtChunk("thought-1", text)}}, nil
+				case "tool_start":
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{
+						commandbridge.ToolCallStart("tool-1", "Run tests", "execute", "in_progress", map[string]any{"command": "go test ./..."}),
+					}}, nil
+				case "tool_finish":
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{
+						commandbridge.ToolCallFinish("tool-1", "Run tests", "execute", "completed", "ok"),
+					}}, nil
+				case "usage":
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{commandbridge.UsageUpdate(12, 200)}}, nil
+				default:
+					return commandbridge.JSONLMapping{}, nil
+				}
+			})
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			prompts = append(prompts, text)
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			stream := strings.Join([]string{
+				`{"type":"tool_start"}`,
+				`{"type":"thought","text":"checking"}`,
+				`{"type":"message","text":"done"}`,
+				`{"type":"usage"}`,
+				`{"type":"tool_finish"}`,
+				"",
+			}, "\n")
+			if err := onStdout([]byte(stream[:len(stream)/2])); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			if err := onStdout([]byte(stream[len(stream)/2:])); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			return adapterprocess.Result{Stdout: []byte(stream)}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "first"))
+	if len(responses) != 8 {
+		t.Fatalf("got %d responses, want command start + 5 parsed updates + command finish + prompt response: %#v", len(responses), responses)
+	}
+	start := decodeCommandToolUpdate(t, responses[0])
+	if start.Update.SessionUpdate != "tool_call" || start.Update.Title != "Run agent" {
+		t.Fatalf("start = %#v, want outer command tool start", start)
+	}
+	innerStart := decodeCommandToolUpdate(t, responses[1])
+	if innerStart.Update.SessionUpdate != "tool_call" ||
+		innerStart.Update.ToolCallID != "tool-1" ||
+		innerStart.Update.Title != "Run tests" ||
+		innerStart.Update.Kind != "execute" ||
+		innerStart.Update.RawInput["command"] != "go test ./..." {
+		t.Fatalf("inner start = %#v, want parsed tool start", innerStart)
+	}
+	thought := decodeAgentChunk(t, responses[2])
+	if thought.Update.SessionUpdate != "agent_thought_chunk" || thought.Update.Content.Text != "checking" {
+		t.Fatalf("thought = %#v, want parsed thought", thought)
+	}
+	message := decodeAgentChunk(t, responses[3])
+	if message.Update.SessionUpdate != "agent_message_chunk" || message.Update.Content.Text != "done" {
+		t.Fatalf("message = %#v, want parsed message", message)
+	}
+	usage := decodeUsageUpdate(t, responses[4])
+	if usage.Update.Used != 12 || usage.Update.Size != 200 {
+		t.Fatalf("usage = %#v, want parsed usage", usage)
+	}
+	innerFinish := decodeCommandToolUpdate(t, responses[5])
+	if innerFinish.Update.SessionUpdate != "tool_call_update" ||
+		innerFinish.Update.ToolCallID != "tool-1" ||
+		innerFinish.Update.Status != "completed" ||
+		innerFinish.Update.Content[0].Content.Text != "ok" {
+		t.Fatalf("inner finish = %#v, want parsed tool finish", innerFinish)
+	}
+	finish := decodeCommandToolUpdate(t, responses[6])
+	if finish.Update.SessionUpdate != "tool_call_update" || finish.Update.ToolCallID != start.Update.ToolCallID {
+		t.Fatalf("finish = %#v, want outer command finish", finish)
+	}
+
+	client.Send(promptRequest(3, "session-1", "second"))
+	if len(prompts) != 2 ||
+		!strings.Contains(prompts[1], "Assistant:\ndone") ||
+		strings.Contains(prompts[1], `{"type":"message"`) {
+		t.Fatalf("second prompt = %q, want cleaned transcript prelude", prompts[1])
+	}
+}
+
 func TestBridgeRejectsUnsupportedConfigValue(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
@@ -655,6 +764,28 @@ func decodeAgentChunk(t testing.TB, response acptest.Response) agentChunkUpdate 
 	}
 	var update agentChunkUpdate
 	response.ParamsInto(t, &update)
+	return update
+}
+
+type usageUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		Used          int    `json:"used"`
+		Size          int    `json:"size"`
+	} `json:"update"`
+}
+
+func decodeUsageUpdate(t testing.TB, response acptest.Response) usageUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update usageUpdate
+	response.ParamsInto(t, &update)
+	if update.Update.SessionUpdate != "usage_update" {
+		t.Fatalf("session update = %q, want usage_update", update.Update.SessionUpdate)
+	}
 	return update
 }
 

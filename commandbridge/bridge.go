@@ -49,6 +49,7 @@ type Spec struct {
 	IncludeTranscript      bool
 	MaxTranscriptExchanges int
 	BuildPrompt            PromptCommandBuilder
+	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 }
 
 type Bridge struct {
@@ -299,31 +300,56 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if err != nil {
 		return nil, invalidParams("build prompt command", err.Error())
 	}
-	result, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command)
+	parser := b.newStreamParser(state.Session, promptParams)
+	result, assistantText, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command, parser)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
-	b.recordTranscriptExchange(req.SessionID, PromptText(req), string(result.Stdout))
+	b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText)
 	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
 }
 
-func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec) (adapterprocess.Result, error) {
+func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec, parser StreamParser) (adapterprocess.Result, string, error) {
 	toolCallID := b.newToolCallID()
 	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, command); err != nil {
-		return adapterprocess.Result{}, fmt.Errorf("notify prompt tool start: %w", err)
+		return adapterprocess.Result{}, "", fmt.Errorf("notify prompt tool start: %w", err)
 	}
 
 	if runner, ok := b.spec.Runner.(StreamRunner); ok {
+		var assistantText strings.Builder
 		result, err := runner.RunStream(runCtx, command, func(chunk []byte) error {
-			return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
+			if parser == nil {
+				assistantText.Write(chunk)
+				return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
+			}
+			events, parseErr := parser.Parse(chunk)
+			if parseErr != nil {
+				return parseErr
+			}
+			return notifyStreamEvents(methodCtx, sessionID, events)
 		})
-		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, err, runCtx.Err()); notifyErr != nil && err == nil {
+		if parser != nil {
+			events, flushErr := parser.Flush()
+			if flushErr != nil && err == nil {
+				err = flushErr
+			}
+			if notifyErr := notifyStreamEvents(methodCtx, sessionID, events); notifyErr != nil && err == nil {
+				err = notifyErr
+			}
+			assistantText.WriteString(parser.Transcript())
+		}
+		finishResult := result
+		if parser != nil {
+			finishResult.Stdout = nil
+			finishResult.StdoutTruncated = false
+		}
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, finishResult, err, runCtx.Err()); notifyErr != nil && err == nil {
 			err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 		}
-		return result, err
+		return result, assistantText.String(), err
 	}
 	result, err := b.spec.Runner.Run(runCtx, command)
 	text := strings.TrimSpace(string(result.Stdout))
@@ -335,7 +361,14 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, err, runCtx.Err()); notifyErr != nil && err == nil {
 		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 	}
-	return result, err
+	return result, string(result.Stdout), err
+}
+
+func (b *Bridge) newStreamParser(session Session, params runtimeacp.PromptParams) StreamParser {
+	if b.spec.NewStreamParser == nil {
+		return nil
+	}
+	return b.spec.NewStreamParser(session, params)
 }
 
 func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.PromptParams) runtimeacp.PromptParams {
@@ -453,6 +486,21 @@ func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text stri
 			},
 		},
 	})
+}
+
+func notifyStreamEvents(ctx *acp.MethodContext, sessionID string, events []StreamEvent) error {
+	for _, event := range events {
+		if len(event.Update) == 0 {
+			continue
+		}
+		if err := ctx.Notify("session/update", map[string]any{
+			"sessionId": sessionID,
+			"update":    event.Update,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Bridge) newToolCallID() string {
