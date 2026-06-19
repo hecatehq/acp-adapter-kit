@@ -31,8 +31,11 @@ Adapters have two runtime integration paths:
   local command for each prompt, emitting a generic `tool_call` activity around
   the command, forwarding stdout as assistant text, cancelling the process when
   ACP `session/cancel` arrives, supporting in-memory `session/load`,
-  `session/resume`, and `session/fork`, and optionally prepending a bounded
-  transcript prelude to later prompt commands.
+  `session/resume`, and `session/fork`, returning command-backed session list
+  metadata, publishing `config_option_update` notifications after config
+  changes, translating structured command streams into ACP updates when a
+  parser is configured, and optionally prepending a bounded transcript prelude
+  to later prompt commands.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.
