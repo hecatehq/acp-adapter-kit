@@ -234,6 +234,252 @@ func TestBridgeRejectsUnsupportedConfigValue(t *testing.T) {
 	}
 }
 
+func TestBridgeLoadSessionRebindsWorkspaceAndKeepsConfig(t *testing.T) {
+	var ids []string
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string {
+			ids = append(ids, "session-1")
+			return "session-1"
+		},
+		Options: []commandbridge.SelectConfigOption{{
+			ID:           "model",
+			Name:         "Model",
+			DefaultValue: "default",
+			Options: []commandbridge.SelectValue{
+				{Value: "default", Name: "Default"},
+				{Value: "smart", Name: "Smart"},
+			},
+		}},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{session.Config["model"], text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			if spec.Dir != "/tmp/rebound" || strings.Join(spec.Args, " ") != "smart hello" {
+				t.Fatalf("process spec = %#v, want rebound cwd and kept config", spec)
+			}
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/original"})
+	client.Request("session/set_config_option", map[string]any{
+		"sessionId": "session-1",
+		"configId":  "model",
+		"value":     "smart",
+	})
+
+	loaded := client.Request("session/load", map[string]any{
+		"sessionId":             "session-1",
+		"cwd":                   "/tmp/rebound",
+		"additionalDirectories": []string{"/tmp/shared"},
+	})
+	var loadResult struct {
+		ConfigOptions []struct {
+			ID           string `json:"id"`
+			CurrentValue string `json:"currentValue"`
+		} `json:"configOptions"`
+	}
+	loaded.ResultInto(t, &loadResult)
+	if len(loadResult.ConfigOptions) != 1 || loadResult.ConfigOptions[0].CurrentValue != "smart" {
+		t.Fatalf("load result = %#v, want kept config", loadResult.ConfigOptions)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("generated ids = %#v, want no new session id on load", ids)
+	}
+
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt":    []map[string]any{{"type": "text", "text": "hello"}},
+		},
+	})
+	if len(responses) != 4 {
+		t.Fatalf("responses = %#v, want prompt lifecycle", responses)
+	}
+}
+
+func TestBridgeLoadSessionRejectsStaleID(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{}, nil
+		},
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	resp := client.Request("session/load", map[string]any{"sessionId": "missing", "cwd": "/tmp/work"})
+	if resp.Error == nil || resp.Error.Code != -32001 || resp.Error.Message != "session not found" {
+		t.Fatalf("load response error = %#v, want session not found", resp.Error)
+	}
+}
+
+func TestBridgeForkSessionClonesConfigAndSeparatesState(t *testing.T) {
+	next := 0
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string {
+			next++
+			return []string{"source", "fork"}[next-1]
+		},
+		Options: []commandbridge.SelectConfigOption{{
+			ID:           "model",
+			Name:         "Model",
+			DefaultValue: "default",
+			Options: []commandbridge.SelectValue{
+				{Value: "default", Name: "Default"},
+				{Value: "smart", Name: "Smart"},
+			},
+		}},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{session.ID, session.Config["model"], text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte(strings.Join(spec.Args, "|") + "@" + spec.Dir)}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/source"})
+	client.Request("session/set_config_option", map[string]any{
+		"sessionId": "source",
+		"configId":  "model",
+		"value":     "smart",
+	})
+
+	forked := client.Request("session/fork", map[string]any{
+		"sessionId": "source",
+		"cwd":       "/tmp/fork",
+	})
+	var forkResult struct {
+		SessionID     string `json:"sessionId"`
+		ConfigOptions []struct {
+			ID           string `json:"id"`
+			CurrentValue string `json:"currentValue"`
+		} `json:"configOptions"`
+	}
+	forked.ResultInto(t, &forkResult)
+	if forkResult.SessionID != "fork" || len(forkResult.ConfigOptions) != 1 || forkResult.ConfigOptions[0].CurrentValue != "smart" {
+		t.Fatalf("fork result = %#v, want fork with cloned smart config", forkResult)
+	}
+
+	client.Request("session/set_config_option", map[string]any{
+		"sessionId": "fork",
+		"configId":  "model",
+		"value":     "default",
+	})
+	sourceResponses := client.Send(promptRequest(5, "source", "hello"))
+	sourceChunk := decodeAgentChunk(t, sourceResponses[1])
+	if sourceChunk.Update.Content.Text != "source|smart|hello@/tmp/source" {
+		t.Fatalf("source chunk = %#v, want source config unaffected", sourceChunk)
+	}
+	forkResponses := client.Send(promptRequest(6, "fork", "hello"))
+	forkChunk := decodeAgentChunk(t, forkResponses[1])
+	if forkChunk.Update.Content.Text != "fork|default|hello@/tmp/fork" {
+		t.Fatalf("fork chunk = %#v, want fork state", forkChunk)
+	}
+}
+
+func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		Commands: []commandbridge.AvailableCommand{
+			{Name: "web", Description: "Search the web", InputHint: "query"},
+			{Name: "plan", Description: "Create a plan"},
+		},
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{}, nil
+		},
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	createResponses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "session/new",
+		"params":  map[string]any{"cwd": "/tmp/work"},
+	})
+	if len(createResponses) != 2 {
+		t.Fatalf("create responses = %#v, want command update + session response", createResponses)
+	}
+	createCommands := decodeAvailableCommands(t, createResponses[0])
+	if createCommands.SessionID != "session-1" ||
+		len(createCommands.Update.AvailableCommands) != 2 ||
+		createCommands.Update.AvailableCommands[0].Name != "web" ||
+		createCommands.Update.AvailableCommands[0].Input.Unstructured.Hint != "query" {
+		t.Fatalf("create commands = %#v, want web + plan commands", createCommands)
+	}
+
+	loadResponses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "session/load",
+		"params":  map[string]any{"sessionId": "session-1", "cwd": "/tmp/work"},
+	})
+	if len(loadResponses) != 2 {
+		t.Fatalf("load responses = %#v, want command update + load response", loadResponses)
+	}
+	loadCommands := decodeAvailableCommands(t, loadResponses[0])
+	if loadCommands.SessionID != "session-1" || len(loadCommands.Update.AvailableCommands) != 2 {
+		t.Fatalf("load commands = %#v, want command replay", loadCommands)
+	}
+}
+
+func TestBridgeCanIncludeBoundedTranscriptInPromptCommand(t *testing.T) {
+	var prompts []string
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:                  func() string { return "session-1" },
+		IncludeTranscript:      true,
+		MaxTranscriptExchanges: 1,
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			prompts = append(prompts, text)
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			current := spec.Args[0]
+			if marker := "Current user request:\n"; strings.Contains(current, marker) {
+				current = current[strings.LastIndex(current, marker)+len(marker):]
+			}
+			return adapterprocess.Result{Stdout: []byte("answer to " + strings.TrimSpace(current))}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	client.Send(promptRequest(2, "session-1", "first"))
+	client.Send(promptRequest(3, "session-1", "second"))
+	client.Send(promptRequest(4, "session-1", "third"))
+
+	if len(prompts) != 3 {
+		t.Fatalf("prompts = %#v, want three prompt builds", prompts)
+	}
+	if prompts[0] != "first" {
+		t.Fatalf("first prompt = %q, want raw first turn", prompts[0])
+	}
+	if !strings.Contains(prompts[1], "Previous conversation:") ||
+		!strings.Contains(prompts[1], "User:\nfirst") ||
+		!strings.Contains(prompts[1], "Assistant:\nanswer to first") ||
+		!strings.Contains(prompts[1], "Current user request:\nsecond") {
+		t.Fatalf("second prompt = %q, want first exchange prelude", prompts[1])
+	}
+	if strings.Contains(prompts[2], "User:\nfirst") ||
+		!strings.Contains(prompts[2], "User:\nsecond") ||
+		!strings.Contains(prompts[2], "Current user request:\nthird") {
+		t.Fatalf("third prompt = %q, want bounded transcript with only second exchange", prompts[2])
+	}
+}
+
 func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	started := make(chan struct{})
 	bridge := commandbridge.New(commandbridge.Spec{
@@ -340,6 +586,18 @@ func server(bridge *commandbridge.Bridge) *acp.Server {
 	}, bridge.Options()...)
 }
 
+func promptRequest(id int, sessionID, prompt string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": sessionID,
+			"prompt":    []map[string]any{{"type": "text", "text": prompt}},
+		},
+	}
+}
+
 type streamingRunnerFunc func(context.Context, adapterprocess.Spec, func([]byte) error) (adapterprocess.Result, error)
 
 func (f streamingRunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
@@ -397,5 +655,34 @@ func decodeAgentChunk(t testing.TB, response acptest.Response) agentChunkUpdate 
 	}
 	var update agentChunkUpdate
 	response.ParamsInto(t, &update)
+	return update
+}
+
+type availableCommandsUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate     string `json:"sessionUpdate"`
+		AvailableCommands []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Input       struct {
+				Unstructured struct {
+					Hint string `json:"hint"`
+				} `json:"unstructured"`
+			} `json:"input"`
+		} `json:"availableCommands"`
+	} `json:"update"`
+}
+
+func decodeAvailableCommands(t testing.TB, response acptest.Response) availableCommandsUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update availableCommandsUpdate
+	response.ParamsInto(t, &update)
+	if update.Update.SessionUpdate != "available_commands_update" {
+		t.Fatalf("session update = %q, want available_commands_update", update.Update.SessionUpdate)
+	}
 	return update
 }

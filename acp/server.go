@@ -28,6 +28,7 @@ type Capabilities struct {
 	EmbeddedContext bool
 	MCPHTTP         bool
 	MCPSSE          bool
+	LoadSession     bool
 }
 
 type Server struct {
@@ -290,6 +291,7 @@ func (s *Server) handle(ctx *MethodContext, req request) response {
 		return resultResponse(req.ID, initializeResult{
 			ProtocolVersion: sdk.ProtocolVersionNumber,
 			AgentCapabilities: agentCapabilities{
+				LoadSession: s.info.Capabilities.LoadSession,
 				PromptCapabilities: promptCapabilities{
 					Image:           s.info.Capabilities.Images,
 					EmbeddedContext: s.info.Capabilities.EmbeddedContext,
@@ -405,6 +407,7 @@ type initializeResult struct {
 }
 
 type agentCapabilities struct {
+	LoadSession        bool               `json:"loadSession,omitempty"`
 	PromptCapabilities promptCapabilities `json:"promptCapabilities"`
 	MCPCapabilities    mcpCapabilities    `json:"mcpCapabilities"`
 }

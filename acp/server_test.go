@@ -21,6 +21,7 @@ func TestInitializeResponse(t *testing.T) {
 			Images:          true,
 			EmbeddedContext: true,
 			MCPHTTP:         true,
+			LoadSession:     true,
 		},
 	})
 
@@ -40,6 +41,9 @@ func TestInitializeResponse(t *testing.T) {
 		t.Fatalf("agent name = %v", info["name"])
 	}
 	caps := result["agentCapabilities"].(map[string]any)
+	if caps["loadSession"] != true {
+		t.Fatalf("loadSession = %v, want true", caps["loadSession"])
+	}
 	promptCaps := caps["promptCapabilities"].(map[string]any)
 	if promptCaps["image"] != true || promptCaps["embeddedContext"] != true {
 		t.Fatalf("prompt capabilities = %#v", promptCaps)

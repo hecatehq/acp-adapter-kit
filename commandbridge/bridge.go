@@ -42,10 +42,13 @@ func (ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, on
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
 
 type Spec struct {
-	Runner      Runner
-	NewID       func() string
-	Options     []SelectConfigOption
-	BuildPrompt PromptCommandBuilder
+	Runner                 Runner
+	NewID                  func() string
+	Options                []SelectConfigOption
+	Commands               []AvailableCommand
+	IncludeTranscript      bool
+	MaxTranscriptExchanges int
+	BuildPrompt            PromptCommandBuilder
 }
 
 type Bridge struct {
@@ -82,11 +85,27 @@ type SelectValue struct {
 	Description string
 }
 
-type sessionState struct {
-	Session
+type AvailableCommand struct {
+	Name        string
+	Description string
+	InputHint   string
 }
 
-const toolOutputPreviewLimit = 8 * 1024
+type sessionState struct {
+	Session
+	transcript []transcriptExchange
+}
+
+type transcriptExchange struct {
+	User      string
+	Assistant string
+}
+
+const (
+	defaultMaxTranscriptExchanges = 8
+	toolOutputPreviewLimit        = 8 * 1024
+	commandPreviewLimit           = 2 * 1024
+)
 
 func New(spec Spec) *Bridge {
 	if spec.Runner == nil {
@@ -105,6 +124,9 @@ func (b *Bridge) Options() []acp.Option {
 	}
 	return []acp.Option{
 		acp.WithMethod("session/new", b.newSession),
+		acp.WithMethod("session/fork", b.forkSession),
+		acp.WithMethod("session/load", b.loadSession),
+		acp.WithMethod("session/resume", b.resumeSession),
 		acp.WithMethod("session/list", b.listSessions),
 		acp.WithMethod("session/set_config_option", b.setConfigOption),
 		acp.WithMethod("session/set_mode", b.setMode),
@@ -116,7 +138,7 @@ func (b *Bridge) Options() []acp.Option {
 	}
 }
 
-func (b *Bridge) newSession(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+func (b *Bridge) newSession(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
 	var req runtimeacp.NewSessionParams
 	if rpcErr := decodeParams(params, &req); rpcErr != nil {
 		return nil, rpcErr
@@ -125,17 +147,81 @@ func (b *Bridge) newSession(_ *acp.MethodContext, params json.RawMessage) (any, 
 	state := &sessionState{Session: Session{
 		ID:                    id,
 		CWD:                   strings.TrimSpace(req.CWD),
-		AdditionalDirectories: append([]string(nil), req.AdditionalDirectories...),
-		MCPServers:            append([]runtimeacp.MCPServer(nil), req.MCPServers...),
+		AdditionalDirectories: cloneStrings(req.AdditionalDirectories),
+		MCPServers:            cloneMCPServers(req.MCPServers),
 		Config:                defaultConfig(b.spec.Options),
 	}}
 	b.mu.Lock()
 	b.sessions[id] = state
 	b.mu.Unlock()
+	if err := b.notifyAvailableCommands(ctx, id); err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
+	}
 	return map[string]any{
 		"sessionId":     id,
 		"configOptions": b.configOptions(state),
 	}, nil
+}
+
+func (b *Bridge) forkSession(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req runtimeacp.ForkSessionParams
+	if rpcErr := decodeParams(params, &req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	source, rpcErr := b.session(req.SessionID)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	id := b.newID()
+	state := &sessionState{Session: Session{
+		ID:                    id,
+		CWD:                   strings.TrimSpace(firstNonEmpty(req.CWD, source.CWD)),
+		AdditionalDirectories: cloneStrings(firstNonNil(req.AdditionalDirectories, source.AdditionalDirectories)),
+		MCPServers:            cloneMCPServers(firstNonNil(req.MCPServers, source.MCPServers)),
+		Config:                cloneStringMap(source.Config),
+		ModeID:                source.ModeID,
+	}}
+	state.transcript = cloneTranscript(source.transcript)
+	b.mu.Lock()
+	b.sessions[id] = state
+	b.mu.Unlock()
+	if err := b.notifyAvailableCommands(ctx, id); err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
+	}
+	return map[string]any{
+		"sessionId":     id,
+		"configOptions": b.configOptions(state),
+	}, nil
+}
+
+func (b *Bridge) loadSession(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req runtimeacp.LoadSessionParams
+	if rpcErr := decodeParams(params, &req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	state, rpcErr := b.rebindSession(req.SessionID, req.CWD, req.AdditionalDirectories, req.MCPServers)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if err := b.notifyAvailableCommands(ctx, req.SessionID); err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
+	}
+	return map[string]any{"configOptions": b.configOptions(state)}, nil
+}
+
+func (b *Bridge) resumeSession(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req runtimeacp.ResumeSessionParams
+	if rpcErr := decodeParams(params, &req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	state, rpcErr := b.rebindSession(req.SessionID, req.CWD, req.AdditionalDirectories, req.MCPServers)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if err := b.notifyAvailableCommands(ctx, req.SessionID); err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
+	}
+	return map[string]any{"configOptions": b.configOptions(state)}, nil
 }
 
 func (b *Bridge) listSessions(_ *acp.MethodContext, _ json.RawMessage) (any, *acp.RPCError) {
@@ -200,6 +286,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
+	promptParams := b.promptParamsForSession(state, req)
 	runCtx, cancel := context.WithCancel(methodContext(ctx))
 	if rpcErr := b.beginPrompt(req.SessionID, cancel); rpcErr != nil {
 		cancel()
@@ -208,7 +295,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	defer b.endPrompt(req.SessionID)
 	defer cancel()
 
-	command, err := b.spec.BuildPrompt(state.Session, req)
+	command, err := b.spec.BuildPrompt(state.Session, promptParams)
 	if err != nil {
 		return nil, invalidParams("build prompt command", err.Error())
 	}
@@ -219,6 +306,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
+	b.recordTranscriptExchange(req.SessionID, PromptText(req), string(result.Stdout))
 	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
 }
 
@@ -248,6 +336,71 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 	}
 	return result, err
+}
+
+func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.PromptParams) runtimeacp.PromptParams {
+	if !b.spec.IncludeTranscript {
+		return req
+	}
+	userText := PromptText(req)
+	if userText == "" || len(state.transcript) == 0 {
+		return req
+	}
+	text := transcriptPrompt(state.transcript, userText)
+	out := req
+	out.Prompt = []runtimeacp.ContentBlock{{Type: "text", Text: text}}
+	return out
+}
+
+func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText string) {
+	if !b.spec.IncludeTranscript {
+		return
+	}
+	userText = strings.TrimSpace(userText)
+	assistantText = strings.TrimSpace(assistantText)
+	if userText == "" && assistantText == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.sessions[sessionID]
+	if state == nil {
+		return
+	}
+	state.transcript = append(state.transcript, transcriptExchange{
+		User:      userText,
+		Assistant: assistantText,
+	})
+	if max := b.maxTranscriptExchanges(); max > 0 && len(state.transcript) > max {
+		state.transcript = append([]transcriptExchange(nil), state.transcript[len(state.transcript)-max:]...)
+	}
+}
+
+func (b *Bridge) maxTranscriptExchanges() int {
+	if b.spec.MaxTranscriptExchanges > 0 {
+		return b.spec.MaxTranscriptExchanges
+	}
+	return defaultMaxTranscriptExchanges
+}
+
+func transcriptPrompt(history []transcriptExchange, current string) string {
+	var builder strings.Builder
+	builder.WriteString("Previous conversation:\n")
+	for _, exchange := range history {
+		if user := strings.TrimSpace(exchange.User); user != "" {
+			builder.WriteString("\nUser:\n")
+			builder.WriteString(user)
+			builder.WriteString("\n")
+		}
+		if assistant := strings.TrimSpace(exchange.Assistant); assistant != "" {
+			builder.WriteString("\nAssistant:\n")
+			builder.WriteString(assistant)
+			builder.WriteString("\n")
+		}
+	}
+	builder.WriteString("\nCurrent user request:\n")
+	builder.WriteString(strings.TrimSpace(current))
+	return strings.TrimSpace(builder.String())
 }
 
 func notifyPromptToolCallStart(ctx *acp.MethodContext, sessionID, toolCallID string, command adapterprocess.Spec) error {
@@ -337,7 +490,11 @@ func promptCommandPreview(command adapterprocess.Spec) string {
 			parts = append(parts, arg)
 		}
 	}
-	return strings.Join(parts, " ")
+	preview := strings.Join(parts, " ")
+	if len(preview) > commandPreviewLimit {
+		return preview[:commandPreviewLimit] + "..."
+	}
+	return preview
 }
 
 func promptCommandToolContent(result adapterprocess.Result, runErr, contextErr error) []map[string]any {
@@ -431,9 +588,69 @@ func (b *Bridge) session(id string) (*sessionState, *acp.RPCError) {
 	}
 	clone := *state
 	clone.Config = cloneStringMap(state.Config)
-	clone.AdditionalDirectories = append([]string(nil), state.AdditionalDirectories...)
-	clone.MCPServers = append([]runtimeacp.MCPServer(nil), state.MCPServers...)
+	clone.AdditionalDirectories = cloneStrings(state.AdditionalDirectories)
+	clone.MCPServers = cloneMCPServers(state.MCPServers)
+	clone.transcript = cloneTranscript(state.transcript)
 	return &clone, nil
+}
+
+func (b *Bridge) rebindSession(id, cwd string, additionalDirectories []string, mcpServers []runtimeacp.MCPServer) (*sessionState, *acp.RPCError) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.sessions[id]
+	if state == nil {
+		return nil, notFound("session not found", id)
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		state.CWD = cwd
+	}
+	if additionalDirectories != nil {
+		state.AdditionalDirectories = cloneStrings(additionalDirectories)
+	}
+	if mcpServers != nil {
+		state.MCPServers = cloneMCPServers(mcpServers)
+	}
+	clone := *state
+	clone.Config = cloneStringMap(state.Config)
+	clone.AdditionalDirectories = cloneStrings(state.AdditionalDirectories)
+	clone.MCPServers = cloneMCPServers(state.MCPServers)
+	clone.transcript = cloneTranscript(state.transcript)
+	return &clone, nil
+}
+
+func (b *Bridge) notifyAvailableCommands(ctx *acp.MethodContext, sessionID string) error {
+	if len(b.spec.Commands) == 0 {
+		return nil
+	}
+	commands := make([]map[string]any, 0, len(b.spec.Commands))
+	for _, command := range b.spec.Commands {
+		name := strings.TrimSpace(command.Name)
+		if name == "" {
+			continue
+		}
+		item := map[string]any{
+			"name": name,
+		}
+		if description := strings.TrimSpace(command.Description); description != "" {
+			item["description"] = description
+		}
+		if hint := strings.TrimSpace(command.InputHint); hint != "" {
+			item["input"] = map[string]any{
+				"unstructured": map[string]any{"hint": hint},
+			}
+		}
+		commands = append(commands, item)
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update": map[string]any{
+			"sessionUpdate":     "available_commands_update",
+			"availableCommands": commands,
+		},
+	})
 }
 
 func (b *Bridge) beginPrompt(sessionID string, cancel context.CancelFunc) *acp.RPCError {
@@ -640,4 +857,52 @@ func cloneStringMap(values map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
+func cloneMCPServers(values []runtimeacp.MCPServer) []runtimeacp.MCPServer {
+	if values == nil {
+		return nil
+	}
+	out := make([]runtimeacp.MCPServer, len(values))
+	for i, value := range values {
+		out[i] = value
+		out[i].Args = append([]string(nil), value.Args...)
+		out[i].Env = append([]runtimeacp.EnvVariable(nil), value.Env...)
+		out[i].Headers = append([]runtimeacp.HTTPHeader(nil), value.Headers...)
+		if value.Meta != nil {
+			out[i].Meta = make(map[string]any, len(value.Meta))
+			for key, metaValue := range value.Meta {
+				out[i].Meta[key] = metaValue
+			}
+		}
+	}
+	return out
+}
+
+func cloneTranscript(values []transcriptExchange) []transcriptExchange {
+	if values == nil {
+		return nil
+	}
+	return append([]transcriptExchange(nil), values...)
+}
+
+func firstNonEmpty(first, fallback string) string {
+	if strings.TrimSpace(first) != "" {
+		return first
+	}
+	return fallback
+}
+
+func firstNonNil[T any](first, fallback []T) []T {
+	if first != nil {
+		return first
+	}
+	return fallback
 }
