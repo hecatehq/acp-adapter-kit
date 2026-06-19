@@ -94,6 +94,51 @@ func TestRuntimeBinaryRequiresRuntimeWorkdir(t *testing.T) {
 	}
 }
 
+func TestRuntimeFlagsUseConfiguredEnvironmentPolicy(t *testing.T) {
+	t.Setenv("GO_WANT_ADAPTERCLI_RUNTIME_HELPER", "1")
+	t.Setenv("AGENT_API_KEY", "sk-runtime")
+	t.Setenv("AGENT_SECRET", "should-not-leak")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")
+	spec := testSpec(input, &stdout, &stderr)
+	spec.Runtime = adaptercli.RuntimeSpec{
+		InheritEnv: []string{"GO_WANT_ADAPTERCLI_RUNTIME_HELPER", "AGENT_API_KEY"},
+		ExtraEnv:   map[string]string{"AGENT_HOME": "runtime-home"},
+	}
+
+	code := adaptercli.Run([]string{
+		"--runtime-binary", os.Args[0],
+		"--runtime-workdir", t.TempDir(),
+		"--runtime-arg=-test.run=TestAdapterCLIRuntimeHelper",
+		"--runtime-arg=--",
+		"--runtime-arg=adaptercli-runtime-helper",
+	}, spec)
+
+	if code != 0 {
+		t.Fatalf("Run returned %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v\n%s", err, stdout.String())
+	}
+	rawResult, err := json.Marshal(response["result"])
+	if err != nil {
+		t.Fatalf("marshal initialize result: %v", err)
+	}
+	var result struct {
+		AgentInfo struct {
+			Name string `json:"name"`
+		} `json:"agentInfo"`
+	}
+	if err := json.Unmarshal(rawResult, &result); err != nil {
+		t.Fatalf("decode initialize result: %v\n%s", err, rawResult)
+	}
+	if result.AgentInfo.Name != "runtime-env-helper" {
+		t.Fatalf("agent name = %q, want runtime-env-helper", result.AgentInfo.Name)
+	}
+}
+
 func TestDoctorCommandWritesJSONReport(t *testing.T) {
 	t.Setenv("GO_WANT_ADAPTERCLI_DOCTOR_HELPER", "1")
 	t.Setenv("AGENT_API_KEY", "sk-agent-cli-secret")
@@ -202,4 +247,62 @@ func TestAdapterCLIDoctorHelper(t *testing.T) {
 	}
 	fmt.Printf("fake-agent 1.2.3 token=%s\n", os.Getenv("AGENT_API_KEY"))
 	os.Exit(0)
+}
+
+func TestAdapterCLIRuntimeHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_ADAPTERCLI_RUNTIME_HELPER") != "1" || !hasArg(os.Args, "adaptercli-runtime-helper") {
+		return
+	}
+	if os.Getenv("AGENT_API_KEY") != "sk-runtime" {
+		fmt.Fprintf(os.Stderr, "AGENT_API_KEY=%q\n", os.Getenv("AGENT_API_KEY"))
+		os.Exit(3)
+	}
+	if os.Getenv("AGENT_HOME") != "runtime-home" {
+		fmt.Fprintf(os.Stderr, "AGENT_HOME=%q\n", os.Getenv("AGENT_HOME"))
+		os.Exit(4)
+	}
+	if os.Getenv("AGENT_SECRET") != "" {
+		fmt.Fprintf(os.Stderr, "AGENT_SECRET leaked\n")
+		os.Exit(5)
+	}
+	decoder := json.NewDecoder(os.Stdin)
+	encoder := json.NewEncoder(os.Stdout)
+	for {
+		var msg struct {
+			ID     json.RawMessage `json:"id,omitempty"`
+			Method string          `json:"method"`
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			return
+		}
+		switch msg.Method {
+		case "initialize":
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(msg.ID),
+				"result": map[string]any{
+					"protocolVersion": 1,
+					"agentInfo":       map[string]any{"name": "runtime-env-helper"},
+					"agentCapabilities": map[string]any{
+						"loadSession": true,
+					},
+				},
+			})
+		default:
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(msg.ID),
+				"error":   map[string]any{"code": -32601, "message": "not found"},
+			})
+		}
+	}
+}
+
+func hasArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }

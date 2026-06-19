@@ -17,6 +17,11 @@ Adapter repositories should keep provider-specific behavior local, including
 binary names, capabilities, environment allowlists, doctor wording, launch
 defaults, README copy, release workflows, and vendor-specific ACP quirks.
 
+Process-backed runtime launches use explicit environment policies. Adapter
+repos should pass only the provider-specific runtime variables they intend the
+child runtime to see; the kit does not inherit the parent environment by
+default.
+
 ## Verification
 
 Run the kit test suite with:
