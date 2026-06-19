@@ -15,12 +15,18 @@ import (
 )
 
 type Spec struct {
-	Info   acp.AdapterInfo
-	Short  string
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
-	Doctor *DoctorSpec
+	Info    acp.AdapterInfo
+	Short   string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Runtime RuntimeSpec
+	Doctor  *DoctorSpec
+}
+
+type RuntimeSpec struct {
+	InheritEnv []string
+	ExtraEnv   map[string]string
 }
 
 type DoctorSpec struct {
@@ -67,9 +73,11 @@ func NewRootCommand(spec Spec) *cobra.Command {
 				}
 				host := runtimehost.NewDeferred(cmd.Context(), runtimehost.Spec{
 					Launch: runtimeproc.LaunchSpec{
-						Binary:  runtimeBinary,
-						Args:    runtimeArgs,
-						WorkDir: runtimeWorkDir,
+						Binary:     runtimeBinary,
+						Args:       runtimeArgs,
+						WorkDir:    runtimeWorkDir,
+						InheritEnv: append([]string(nil), spec.Runtime.InheritEnv...),
+						ExtraEnv:   cloneStringMap(spec.Runtime.ExtraEnv),
 					},
 					ClientInfo: runtimeacp.ImplementationInfo{
 						Name:    info.Name,
