@@ -28,8 +28,9 @@ Adapters have two runtime integration paths:
 
 - `runtimehost` / `runtimebridge` proxy an explicit child ACP runtime process.
 - `commandbridge` owns lightweight ACP sessions in Go and invokes a configured
-  local command for each prompt, forwarding stdout as assistant text and
-  cancelling the process when ACP `session/cancel` arrives.
+  local command for each prompt, emitting a generic `tool_call` activity around
+  the command, forwarding stdout as assistant text, and cancelling the process
+  when ACP `session/cancel` arrives.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

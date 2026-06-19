@@ -173,11 +173,33 @@ func TestCommandBridgeServesSessionMethodsWithoutRuntimeFlags(t *testing.T) {
 		t.Fatalf("Run returned %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
 	}
 	responses := decodeResponses(t, stdout.Bytes())
-	if len(responses) != 3 {
-		t.Fatalf("got %d responses, want session/new + update + prompt\n%s", len(responses), stdout.String())
+	if len(responses) != 5 {
+		t.Fatalf("got %d responses, want session/new + tool start + chunk + tool finish + prompt\n%s", len(responses), stdout.String())
 	}
-	if responses[1].Method != "session/update" {
-		t.Fatalf("second response method = %q, want session/update", responses[1].Method)
+	start := decodeCLIUpdate(t, responses[1])
+	if start.Update.SessionUpdate != "tool_call" ||
+		start.Update.ToolCallID == "" ||
+		start.Update.Status != "in_progress" ||
+		start.Update.RawInput["command"] != "test-agent hello" ||
+		start.Update.RawInput["cwd"] != "/tmp/work" {
+		t.Fatalf("tool start = %#v, want command metadata", start)
+	}
+	chunk := decodeCLIUpdate(t, responses[2])
+	var chunkContent struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(chunk.Update.Content, &chunkContent); err != nil {
+		t.Fatalf("decode chunk content: %v\n%s", err, string(chunk.Update.Content))
+	}
+	if chunk.Update.SessionUpdate != "agent_message_chunk" ||
+		chunkContent.Text != "hi from command bridge" {
+		t.Fatalf("chunk = %#v, want assistant output", chunk)
+	}
+	finish := decodeCLIUpdate(t, responses[3])
+	if finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.ToolCallID != start.Update.ToolCallID ||
+		finish.Update.Status != "completed" {
+		t.Fatalf("tool finish = %#v, want completed command", finish)
 	}
 }
 
@@ -272,6 +294,7 @@ func testSpec(stdin *strings.Reader, stdout *bytes.Buffer, stderr *bytes.Buffer)
 type cliResponse struct {
 	ID     json.RawMessage `json:"id,omitempty"`
 	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
 }
 
 func decodeResponses(t testing.TB, raw []byte) []cliResponse {
@@ -289,6 +312,29 @@ func decodeResponses(t testing.TB, raw []byte) []cliResponse {
 		out = append(out, response)
 	}
 	return out
+}
+
+type cliSessionUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string          `json:"sessionUpdate"`
+		ToolCallID    string          `json:"toolCallId"`
+		Status        string          `json:"status"`
+		RawInput      map[string]any  `json:"rawInput"`
+		Content       json.RawMessage `json:"content"`
+	} `json:"update"`
+}
+
+func decodeCLIUpdate(t testing.TB, response cliResponse) cliSessionUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update cliSessionUpdate
+	if err := json.Unmarshal(response.Params, &update); err != nil {
+		t.Fatalf("decode update: %v\n%s", err, string(response.Params))
+	}
+	return update
 }
 
 func TestAdapterCLIDoctorHelper(t *testing.T) {

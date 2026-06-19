@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,8 @@ type SelectValue struct {
 type sessionState struct {
 	Session
 }
+
+const toolOutputPreviewLimit = 8 * 1024
 
 func New(spec Spec) *Bridge {
 	if spec.Runner == nil {
@@ -220,10 +223,19 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 }
 
 func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec) (adapterprocess.Result, error) {
+	toolCallID := b.newToolCallID()
+	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, command); err != nil {
+		return adapterprocess.Result{}, fmt.Errorf("notify prompt tool start: %w", err)
+	}
+
 	if runner, ok := b.spec.Runner.(StreamRunner); ok {
-		return runner.RunStream(runCtx, command, func(chunk []byte) error {
+		result, err := runner.RunStream(runCtx, command, func(chunk []byte) error {
 			return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
 		})
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, err, runCtx.Err()); notifyErr != nil && err == nil {
+			err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
+		}
+		return result, err
 	}
 	result, err := b.spec.Runner.Run(runCtx, command)
 	text := strings.TrimSpace(string(result.Stdout))
@@ -232,7 +244,46 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			err = fmt.Errorf("notification failed: %w", notifyErr)
 		}
 	}
+	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, err, runCtx.Err()); notifyErr != nil && err == nil {
+		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
+	}
 	return result, err
+}
+
+func notifyPromptToolCallStart(ctx *acp.MethodContext, sessionID, toolCallID string, command adapterprocess.Spec) error {
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update": map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    toolCallID,
+			"title":         promptCommandTitle(command),
+			"kind":          "execute",
+			"status":        "in_progress",
+			"rawInput":      promptCommandRawInput(command),
+		},
+	})
+}
+
+func notifyPromptToolCallFinish(ctx *acp.MethodContext, sessionID, toolCallID string, command adapterprocess.Spec, result adapterprocess.Result, runErr, contextErr error) error {
+	status := "completed"
+	if runErr != nil || contextErr != nil {
+		status = "failed"
+	}
+	update := map[string]any{
+		"sessionUpdate": "tool_call_update",
+		"toolCallId":    toolCallID,
+		"title":         promptCommandTitle(command),
+		"kind":          "execute",
+		"status":        status,
+		"rawInput":      promptCommandRawInput(command),
+	}
+	if content := promptCommandToolContent(result, runErr, contextErr); len(content) > 0 {
+		update["content"] = content
+	}
+	return ctx.Notify("session/update", map[string]any{
+		"sessionId": sessionID,
+		"update":    update,
+	})
 }
 
 func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text string) error {
@@ -249,6 +300,88 @@ func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text stri
 			},
 		},
 	})
+}
+
+func (b *Bridge) newToolCallID() string {
+	return fmt.Sprintf("prompt-command-%d", b.nextID.Add(1))
+}
+
+func promptCommandTitle(command adapterprocess.Spec) string {
+	name := strings.TrimSpace(command.Command)
+	if name == "" {
+		return "Run prompt command"
+	}
+	if base := filepath.Base(name); base != "." && base != string(filepath.Separator) && base != "" {
+		name = base
+	}
+	return "Run " + name
+}
+
+func promptCommandRawInput(command adapterprocess.Spec) map[string]any {
+	input := map[string]any{
+		"command": promptCommandPreview(command),
+	}
+	if dir := strings.TrimSpace(command.Dir); dir != "" {
+		input["cwd"] = dir
+	}
+	return input
+}
+
+func promptCommandPreview(command adapterprocess.Spec) string {
+	parts := make([]string, 0, 1+len(command.Args))
+	if strings.TrimSpace(command.Command) != "" {
+		parts = append(parts, command.Command)
+	}
+	for _, arg := range command.Args {
+		if strings.TrimSpace(arg) != "" {
+			parts = append(parts, arg)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func promptCommandToolContent(result adapterprocess.Result, runErr, contextErr error) []map[string]any {
+	parts := make([]string, 0, 3)
+	if text, truncated := limitedToolOutput("stdout", result.Stdout, result.StdoutTruncated); text != "" {
+		parts = append(parts, text)
+		if truncated {
+			parts = append(parts, "stdout truncated")
+		}
+	}
+	if text, truncated := limitedToolOutput("stderr", result.Stderr, result.StderrTruncated); text != "" {
+		parts = append(parts, text)
+		if truncated {
+			parts = append(parts, "stderr truncated")
+		}
+	}
+	if contextErr != nil {
+		parts = append(parts, "cancelled: "+contextErr.Error())
+	} else if runErr != nil && len(parts) == 0 {
+		parts = append(parts, "error: "+runErr.Error())
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return []map[string]any{{
+		"type": "content",
+		"content": map[string]any{
+			"type": "text",
+			"text": strings.Join(parts, "\n\n"),
+		},
+	}}
+}
+
+func limitedToolOutput(label string, raw []byte, alreadyTruncated bool) (string, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return "", alreadyTruncated
+	}
+	truncated := alreadyTruncated
+	if len(text) > toolOutputPreviewLimit {
+		text = text[:toolOutputPreviewLimit]
+		truncated = true
+	}
+	return label + ":\n" + text, truncated
 }
 
 func (b *Bridge) cancelMethod(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {

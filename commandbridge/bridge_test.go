@@ -98,30 +98,41 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 			},
 		},
 	})
-	if len(responses) != 2 {
-		t.Fatalf("got %d responses, want update notification + prompt response: %#v", len(responses), responses)
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want tool start + chunk + tool finish + prompt response: %#v", len(responses), responses)
 	}
-	if responses[0].Method != "session/update" {
-		t.Fatalf("first response method = %q, want session/update", responses[0].Method)
+	start := decodeCommandToolUpdate(t, responses[0])
+	if start.SessionID != "session-1" ||
+		start.Update.SessionUpdate != "tool_call" ||
+		start.Update.ToolCallID == "" ||
+		start.Update.Title != "Run agent" ||
+		start.Update.Kind != "execute" ||
+		start.Update.Status != "in_progress" ||
+		start.Update.RawInput["command"] != "agent --model smart hello\n\nfrom resource" ||
+		start.Update.RawInput["cwd"] != "/tmp/work" {
+		t.Fatalf("tool start = %#v, want prompt command metadata", start)
 	}
-	var update struct {
-		SessionID string `json:"sessionId"`
-		Update    struct {
-			SessionUpdate string `json:"sessionUpdate"`
-			Content       struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"update"`
+
+	chunk := decodeAgentChunk(t, responses[1])
+	if chunk.SessionID != "session-1" || chunk.Update.SessionUpdate != "agent_message_chunk" || chunk.Update.Content.Text != "assistant answer" {
+		t.Fatalf("chunk = %#v, want assistant chunk", chunk)
 	}
-	responses[0].ParamsInto(t, &update)
-	if update.SessionID != "session-1" || update.Update.SessionUpdate != "agent_message_chunk" || update.Update.Content.Text != "assistant answer" {
-		t.Fatalf("update = %#v, want assistant chunk", update)
+
+	finish := decodeCommandToolUpdate(t, responses[2])
+	if finish.SessionID != "session-1" ||
+		finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.ToolCallID != start.Update.ToolCallID ||
+		finish.Update.Title != "Run agent" ||
+		finish.Update.Kind != "execute" ||
+		finish.Update.Status != "completed" ||
+		len(finish.Update.Content) != 1 ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "stdout:\nassistant answer") {
+		t.Fatalf("tool finish = %#v, want completed command metadata", finish)
 	}
 	var promptResult struct {
 		StopReason string `json:"stopReason"`
 	}
-	responses[1].ResultInto(t, &promptResult)
+	responses[3].ResultInto(t, &promptResult)
 	if promptResult.StopReason != "end_turn" {
 		t.Fatalf("stop reason = %q, want end_turn", promptResult.StopReason)
 	}
@@ -165,24 +176,15 @@ func TestBridgeStreamsPromptCommandOutputChunks(t *testing.T) {
 			"prompt":    []map[string]any{{"type": "text", "text": "hello"}},
 		},
 	})
-	if len(responses) != 3 {
-		t.Fatalf("got %d responses, want two chunks + prompt response: %#v", len(responses), responses)
+	if len(responses) != 5 {
+		t.Fatalf("got %d responses, want tool start + two chunks + tool finish + prompt response: %#v", len(responses), responses)
+	}
+	start := decodeCommandToolUpdate(t, responses[0])
+	if start.Update.SessionUpdate != "tool_call" || start.Update.ToolCallID == "" || start.Update.Status != "in_progress" {
+		t.Fatalf("tool start = %#v, want running tool call", start)
 	}
 	for i, want := range []string{"hello ", "stream"} {
-		if responses[i].Method != "session/update" {
-			t.Fatalf("response %d method = %q, want session/update", i, responses[i].Method)
-		}
-		var update struct {
-			SessionID string `json:"sessionId"`
-			Update    struct {
-				SessionUpdate string `json:"sessionUpdate"`
-				Content       struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"update"`
-		}
-		responses[i].ParamsInto(t, &update)
+		update := decodeAgentChunk(t, responses[i+1])
 		if update.SessionID != "session-1" ||
 			update.Update.SessionUpdate != "agent_message_chunk" ||
 			update.Update.Content.Type != "text" ||
@@ -190,10 +192,17 @@ func TestBridgeStreamsPromptCommandOutputChunks(t *testing.T) {
 			t.Fatalf("chunk %d update = %#v, want %q", i, update, want)
 		}
 	}
+	finish := decodeCommandToolUpdate(t, responses[3])
+	if finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.ToolCallID != start.Update.ToolCallID ||
+		finish.Update.Status != "completed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "stdout:\nhello stream") {
+		t.Fatalf("tool finish = %#v, want completed streamed command", finish)
+	}
 	var promptResult struct {
 		StopReason string `json:"stopReason"`
 	}
-	responses[2].ResultInto(t, &promptResult)
+	responses[4].ResultInto(t, &promptResult)
 	if promptResult.StopReason != "end_turn" {
 		t.Fatalf("stop reason = %q, want end_turn", promptResult.StopReason)
 	}
@@ -258,13 +267,24 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	client.Notify("session/cancel", map[string]any{"sessionId": "session-1"})
 
 	responses := <-promptDone
-	if len(responses) != 1 {
-		t.Fatalf("got %d responses, want prompt response", len(responses))
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + tool finish + prompt response", len(responses))
+	}
+	start := decodeCommandToolUpdate(t, responses[0])
+	if start.Update.SessionUpdate != "tool_call" || start.Update.Status != "in_progress" {
+		t.Fatalf("tool start = %#v, want running command", start)
+	}
+	finish := decodeCommandToolUpdate(t, responses[1])
+	if finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.ToolCallID != start.Update.ToolCallID ||
+		finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") {
+		t.Fatalf("tool finish = %#v, want failed cancelled command", finish)
 	}
 	var result struct {
 		StopReason string `json:"stopReason"`
 	}
-	responses[0].ResultInto(t, &result)
+	responses[2].ResultInto(t, &result)
 	if result.StopReason != "cancelled" {
 		t.Fatalf("stop reason = %q, want cancelled", result.StopReason)
 	}
@@ -283,10 +303,27 @@ func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	client := acptest.NewClient(t, server(bridge))
 	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
 
-	resp := client.Request("session/prompt", map[string]any{
-		"sessionId": "session-1",
-		"prompt":    []map[string]any{{"type": "text", "text": "fail"}},
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt":    []map[string]any{{"type": "text", "text": "fail"}},
+		},
 	})
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + tool finish + prompt error", len(responses))
+	}
+	start := decodeCommandToolUpdate(t, responses[0])
+	finish := decodeCommandToolUpdate(t, responses[1])
+	if finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.ToolCallID != start.Update.ToolCallID ||
+		finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "stderr:\nboom") {
+		t.Fatalf("tool finish = %#v, want failed stderr preview", finish)
+	}
+	resp := responses[2]
 	if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != "prompt command failed" {
 		t.Fatalf("response error = %#v, want prompt command failure", resp.Error)
 	}
@@ -311,4 +348,54 @@ func (f streamingRunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) 
 
 func (f streamingRunnerFunc) RunStream(ctx context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
 	return f(ctx, spec, onStdout)
+}
+
+type commandToolUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string         `json:"sessionUpdate"`
+		ToolCallID    string         `json:"toolCallId"`
+		Title         string         `json:"title"`
+		Kind          string         `json:"kind"`
+		Status        string         `json:"status"`
+		RawInput      map[string]any `json:"rawInput"`
+		Content       []struct {
+			Type    string `json:"type"`
+			Content struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"content"`
+	} `json:"update"`
+}
+
+func decodeCommandToolUpdate(t testing.TB, response acptest.Response) commandToolUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update commandToolUpdate
+	response.ParamsInto(t, &update)
+	return update
+}
+
+type agentChunkUpdate struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		Content       struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"update"`
+}
+
+func decodeAgentChunk(t testing.TB, response acptest.Response) agentChunkUpdate {
+	t.Helper()
+	if response.Method != "session/update" {
+		t.Fatalf("response method = %q, want session/update", response.Method)
+	}
+	var update agentChunkUpdate
+	response.ParamsInto(t, &update)
+	return update
 }
