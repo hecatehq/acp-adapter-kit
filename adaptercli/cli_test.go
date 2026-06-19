@@ -2,6 +2,7 @@ package adaptercli_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
 	"github.com/hecatehq/acp-adapter-kit/adaptercli"
+	"github.com/hecatehq/acp-adapter-kit/commandbridge"
 	"github.com/hecatehq/acp-adapter-kit/doctor"
 	adapterprocess "github.com/hecatehq/acp-adapter-kit/process"
+	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
 )
 
 func TestRunVersionFlagAndCommand(t *testing.T) {
@@ -139,6 +142,45 @@ func TestRuntimeFlagsUseConfiguredEnvironmentPolicy(t *testing.T) {
 	}
 }
 
+func TestCommandBridgeServesSessionMethodsWithoutRuntimeFlags(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	input := strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp/work"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"hello"}]}}`,
+	}, "\n") + "\n")
+	spec := testSpec(input, &stdout, &stderr)
+	spec.Command = &commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "test-agent", Dir: session.CWD, Args: []string{text}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			if spec.Command != "test-agent" || spec.Dir != "/tmp/work" || strings.Join(spec.Args, " ") != "hello" {
+				t.Fatalf("process spec = %#v, want command prompt", spec)
+			}
+			return adapterprocess.Result{Stdout: []byte("hi from command bridge")}, nil
+		}),
+	}
+
+	code := adaptercli.Run(nil, spec)
+
+	if code != 0 {
+		t.Fatalf("Run returned %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	responses := decodeResponses(t, stdout.Bytes())
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want session/new + update + prompt\n%s", len(responses), stdout.String())
+	}
+	if responses[1].Method != "session/update" {
+		t.Fatalf("second response method = %q, want session/update", responses[1].Method)
+	}
+}
+
 func TestDoctorCommandWritesJSONReport(t *testing.T) {
 	t.Setenv("GO_WANT_ADAPTERCLI_DOCTOR_HELPER", "1")
 	t.Setenv("AGENT_API_KEY", "sk-agent-cli-secret")
@@ -225,6 +267,28 @@ func testSpec(stdin *strings.Reader, stdout *bytes.Buffer, stderr *bytes.Buffer)
 			EnvVars:     []doctor.EnvVar{{Name: "AGENT_API_KEY"}},
 		},
 	}
+}
+
+type cliResponse struct {
+	ID     json.RawMessage `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+}
+
+func decodeResponses(t testing.TB, raw []byte) []cliResponse {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	out := make([]cliResponse, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var response cliResponse
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatalf("decode response %q: %v", line, err)
+		}
+		out = append(out, response)
+	}
+	return out
 }
 
 func TestAdapterCLIDoctorHelper(t *testing.T) {
