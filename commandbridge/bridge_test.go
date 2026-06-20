@@ -836,6 +836,87 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	}
 }
 
+func TestBridgeCancelStopsStreamingPromptWithoutRecordingTranscript(t *testing.T) {
+	started := make(chan struct{})
+	var prompts []string
+	var runCount int
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:             func() string { return "session-1" },
+		IncludeTranscript: true,
+		BuildPrompt: func(_ commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			prompts = append(prompts, text)
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: streamingRunnerFunc(func(ctx context.Context, _ adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			runCount++
+			if runCount > 1 {
+				if err := onStdout([]byte("second answer")); err != nil {
+					return adapterprocess.Result{}, err
+				}
+				return adapterprocess.Result{Stdout: []byte("second answer")}, nil
+			}
+			if err := onStdout([]byte("partial answer")); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			close(started)
+			<-ctx.Done()
+			return adapterprocess.Result{Stdout: []byte("partial answer\nlate process output")}, ctx.Err()
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	promptDone := make(chan []acptest.Response, 1)
+	go func() {
+		promptDone <- client.Send(promptRequest(2, "session-1", "stop soon"))
+	}()
+	<-started
+	client.Notify("session/cancel", map[string]any{"sessionId": "session-1"})
+
+	responses := <-promptDone
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want tool start + streamed chunk + tool finish + prompt response", len(responses))
+	}
+	chunk := decodeAgentChunk(t, responses[1])
+	if chunk.Update.Content.Text != "partial answer" {
+		t.Fatalf("chunk = %#v, want partial answer", chunk)
+	}
+	finish := decodeCommandToolUpdate(t, responses[2])
+	if finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") {
+		t.Fatalf("tool finish = %#v, want failed cancelled command", finish)
+	}
+	var cancelled struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[3].ResultInto(t, &cancelled)
+	if cancelled.StopReason != "cancelled" {
+		t.Fatalf("stop reason = %q, want cancelled", cancelled.StopReason)
+	}
+
+	followup := client.Send(promptRequest(3, "session-1", "after cancel"))
+	if len(followup) != 5 {
+		t.Fatalf("followup responses = %#v, want normal prompt lifecycle", followup)
+	}
+	var completed struct {
+		StopReason string `json:"stopReason"`
+	}
+	followup[4].ResultInto(t, &completed)
+	if completed.StopReason != "end_turn" {
+		t.Fatalf("followup stop reason = %q, want end_turn", completed.StopReason)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("prompts = %#v, want cancelled prompt plus followup", prompts)
+	}
+	if prompts[1] != "after cancel" {
+		t.Fatalf("followup prompt = %q, want cancelled exchange omitted from transcript", prompts[1])
+	}
+}
+
 func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
