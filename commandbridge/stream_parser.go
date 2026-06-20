@@ -16,7 +16,22 @@ type StreamParser interface {
 }
 
 type StreamEvent struct {
-	Update map[string]any
+	Update            map[string]any
+	PermissionRequest *PermissionRequest
+}
+
+type PermissionRequest struct {
+	ToolCallID string
+	Title      string
+	Kind       string
+	RawInput   any
+	Options    []PermissionOption
+}
+
+type PermissionOption struct {
+	OptionID string
+	Name     string
+	Kind     string
 }
 
 type JSONLMapping struct {
@@ -165,6 +180,23 @@ func ToolCallFinish(id, title, kind, status string, rawOutput any) StreamEvent {
 	return StreamEvent{Update: update}
 }
 
+func ToolCallPermissionRequest(id, title, kind string, rawInput any, options []PermissionOption) StreamEvent {
+	return StreamEvent{PermissionRequest: &PermissionRequest{
+		ToolCallID: id,
+		Title:      firstNonEmpty(title, id),
+		Kind:       firstNonEmpty(kind, "execute"),
+		RawInput:   rawInput,
+		Options:    normalizePermissionOptions(options),
+	}}
+}
+
+func DefaultPermissionOptions() []PermissionOption {
+	return []PermissionOption{
+		{OptionID: "allow_once", Name: "Allow once", Kind: "allow_once"},
+		{OptionID: "reject_once", Name: "Reject", Kind: "reject_once"},
+	}
+}
+
 func UsageUpdate(used, size int) StreamEvent {
 	return StreamEvent{Update: map[string]any{
 		"sessionUpdate": "usage_update",
@@ -185,6 +217,29 @@ func textChunk(updateType, messageID, text string) StreamEvent {
 		update["messageId"] = messageID
 	}
 	return StreamEvent{Update: update}
+}
+
+func normalizePermissionOptions(options []PermissionOption) []PermissionOption {
+	if len(options) == 0 {
+		options = DefaultPermissionOptions()
+	}
+	out := make([]PermissionOption, 0, len(options))
+	for _, option := range options {
+		option.OptionID = strings.TrimSpace(option.OptionID)
+		option.Name = strings.TrimSpace(option.Name)
+		option.Kind = strings.TrimSpace(option.Kind)
+		if option.OptionID == "" {
+			option.OptionID = option.Kind
+		}
+		if option.Kind == "" {
+			option.Kind = option.OptionID
+		}
+		if option.Name == "" {
+			option.Name = option.OptionID
+		}
+		out = append(out, option)
+	}
+	return out
 }
 
 func stringifyStreamValue(value any) string {

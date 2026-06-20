@@ -37,11 +37,12 @@ Adapters have two runtime integration paths:
   metadata, publishing `config_option_update` notifications after config
   changes, publishing `session_info_update` notifications when transcript
   metadata changes, translating structured command streams into ACP updates
-  when a parser is configured, and optionally prepending a bounded transcript
-  prelude to later prompt commands. Adapters for CLIs with native session ids
-  may opt into adopting unknown `session/load` or `session/resume` ids so the
-  provider command can continue a session known to the host after an adapter
-  process restart. Command-backed adapters can also advertise ACP
+  when a parser is configured, requesting ACP tool permissions from parsed
+  stream events before continuing, and optionally prepending a bounded
+  transcript prelude to later prompt commands. Adapters for CLIs with native
+  session ids may opt into adopting unknown `session/load` or `session/resume`
+  ids so the provider command can continue a session known to the host after an
+  adapter process restart. Command-backed adapters can also advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
 

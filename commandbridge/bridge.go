@@ -469,14 +469,14 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			if parseErr != nil {
 				return parseErr
 			}
-			return notifyStreamEvents(methodCtx, sessionID, events)
+			return handleStreamEvents(methodCtx, sessionID, events)
 		})
 		if parser != nil {
 			events, flushErr := parser.Flush()
 			if flushErr != nil && err == nil {
 				err = flushErr
 			}
-			if notifyErr := notifyStreamEvents(methodCtx, sessionID, events); notifyErr != nil && err == nil {
+			if notifyErr := handleStreamEvents(methodCtx, sessionID, events); notifyErr != nil && err == nil {
 				err = notifyErr
 			}
 			assistantText.WriteString(parser.Transcript())
@@ -641,19 +641,129 @@ func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text stri
 	})
 }
 
-func notifyStreamEvents(ctx *acp.MethodContext, sessionID string, events []StreamEvent) error {
+func handleStreamEvents(ctx *acp.MethodContext, sessionID string, events []StreamEvent) error {
 	for _, event := range events {
-		if len(event.Update) == 0 {
-			continue
+		if len(event.Update) > 0 {
+			if err := ctx.Notify("session/update", map[string]any{
+				"sessionId": sessionID,
+				"update":    event.Update,
+			}); err != nil {
+				return err
+			}
 		}
-		if err := ctx.Notify("session/update", map[string]any{
-			"sessionId": sessionID,
-			"update":    event.Update,
-		}); err != nil {
-			return err
+		if event.PermissionRequest != nil {
+			if err := requestStreamPermission(ctx, sessionID, *event.PermissionRequest); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func requestStreamPermission(ctx *acp.MethodContext, sessionID string, req PermissionRequest) error {
+	raw, rpcErr, err := ctx.Request("session/request_permission", permissionRequestParams(sessionID, req))
+	if err != nil {
+		return fmt.Errorf("request permission: %w", err)
+	}
+	if rpcErr != nil {
+		return fmt.Errorf("request permission: %s", rpcErr.Message)
+	}
+	outcome, err := decodePermissionOutcome(raw)
+	if err != nil {
+		return err
+	}
+	switch outcome.Outcome {
+	case "selected":
+		option, ok := findPermissionOption(req.Options, outcome.OptionID)
+		if !ok {
+			option = PermissionOption{OptionID: outcome.OptionID, Kind: outcome.OptionID, Name: outcome.OptionID}
+		}
+		if permissionOptionAllows(option) {
+			return nil
+		}
+		return fmt.Errorf("permission rejected for %s", permissionRequestTitle(req))
+	case "cancelled":
+		return fmt.Errorf("permission cancelled for %s", permissionRequestTitle(req))
+	default:
+		return fmt.Errorf("permission response outcome %q is not supported", outcome.Outcome)
+	}
+}
+
+func permissionRequestParams(sessionID string, req PermissionRequest) map[string]any {
+	options := normalizePermissionOptions(req.Options)
+	toolCall := map[string]any{
+		"toolCallId": permissionToolCallID(req),
+		"title":      permissionRequestTitle(req),
+		"kind":       firstNonEmpty(req.Kind, "execute"),
+		"status":     "pending",
+	}
+	if req.RawInput != nil {
+		toolCall["rawInput"] = req.RawInput
+	}
+	return map[string]any{
+		"sessionId": sessionID,
+		"toolCall":  toolCall,
+		"options":   permissionOptionParams(options),
+	}
+}
+
+func permissionOptionParams(options []PermissionOption) []map[string]string {
+	out := make([]map[string]string, 0, len(options))
+	for _, option := range options {
+		out = append(out, map[string]string{
+			"optionId": option.OptionID,
+			"name":     option.Name,
+			"kind":     option.Kind,
+		})
+	}
+	return out
+}
+
+type permissionOutcome struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"optionId"`
+}
+
+func decodePermissionOutcome(raw json.RawMessage) (permissionOutcome, error) {
+	var response struct {
+		Outcome permissionOutcome `json:"outcome"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return permissionOutcome{}, fmt.Errorf("decode permission response: %w", err)
+	}
+	if response.Outcome.Outcome == "" {
+		return permissionOutcome{}, errors.New("permission response missing outcome")
+	}
+	return response.Outcome, nil
+}
+
+func findPermissionOption(options []PermissionOption, optionID string) (PermissionOption, bool) {
+	for _, option := range normalizePermissionOptions(options) {
+		if option.OptionID == optionID {
+			return option, true
+		}
+	}
+	return PermissionOption{}, false
+}
+
+func permissionOptionAllows(option PermissionOption) bool {
+	kind := strings.ToLower(strings.TrimSpace(option.Kind))
+	id := strings.ToLower(strings.TrimSpace(option.OptionID))
+	return strings.HasPrefix(kind, "allow") || strings.HasPrefix(id, "allow")
+}
+
+func permissionRequestTitle(req PermissionRequest) string {
+	return firstNonEmpty(req.Title, permissionToolCallID(req))
+}
+
+func permissionToolCallID(req PermissionRequest) string {
+	if strings.TrimSpace(req.ToolCallID) != "" {
+		return strings.TrimSpace(req.ToolCallID)
+	}
+	if strings.TrimSpace(req.Title) != "" {
+		return strings.TrimSpace(req.Title)
+	}
+	return "permission-request"
 }
 
 func notifyConfigOptions(ctx *acp.MethodContext, sessionID string, configOptions []map[string]any) error {
