@@ -960,6 +960,36 @@ func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	}
 }
 
+func TestBridgePromptCommandAuthFailureMapsToAuthRequired(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		AuthRequired: func(result adapterprocess.Result, err error) bool {
+			return err != nil && strings.Contains(string(result.Stderr), "not signed in")
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stderr: []byte("agent is not signed in")}, errors.New("exit 1")
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "hello"))
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + tool finish + prompt error", len(responses))
+	}
+	resp := responses[2]
+	if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != "Authentication required" {
+		t.Fatalf("response error = %#v, want auth required", resp.Error)
+	}
+	raw, _ := json.Marshal(resp.Error.Data)
+	if !bytes.Contains(raw, []byte("agent is not signed in")) {
+		t.Fatalf("error data = %s, want stderr", raw)
+	}
+}
+
 func TestBridgeRunsLogoutCommand(t *testing.T) {
 	var saw adapterprocess.Spec
 	bridge := commandbridge.New(commandbridge.Spec{

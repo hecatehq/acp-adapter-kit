@@ -47,6 +47,8 @@ type AuthenticateCommandBuilder func(methodID string) (adapterprocess.Spec, erro
 
 type LogoutCommandBuilder func() (adapterprocess.Spec, error)
 
+type AuthRequiredDetector func(adapterprocess.Result, error) bool
+
 type Spec struct {
 	Runner                 Runner
 	NewID                  func() string
@@ -59,6 +61,7 @@ type Spec struct {
 	BuildPrompt            PromptCommandBuilder
 	BuildAuthenticate      AuthenticateCommandBuilder
 	BuildLogout            LogoutCommandBuilder
+	AuthRequired           AuthRequiredDetector
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 	Now                    func() time.Time
 }
@@ -430,6 +433,9 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	if err != nil {
+		if b.authRequired(result, err) {
+			return nil, authRequired(commandErrorData(result, err))
+		}
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
 	if info, ok := b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText); ok {
@@ -1047,6 +1053,14 @@ func notFound(message string, data any) *acp.RPCError {
 
 func invalidParams(message string, data any) *acp.RPCError {
 	return &acp.RPCError{Code: -32602, Message: message, Data: data}
+}
+
+func authRequired(data any) *acp.RPCError {
+	return &acp.RPCError{Code: -32000, Message: "Authentication required", Data: data}
+}
+
+func (b *Bridge) authRequired(result adapterprocess.Result, err error) bool {
+	return b != nil && b.spec.AuthRequired != nil && b.spec.AuthRequired(result, err)
 }
 
 func commandErrorData(result adapterprocess.Result, err error) map[string]any {
