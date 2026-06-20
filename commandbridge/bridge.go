@@ -46,6 +46,7 @@ type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess
 type Spec struct {
 	Runner                 Runner
 	NewID                  func() string
+	LoadUnknownSessions    bool
 	Options                []SelectConfigOption
 	Commands               []AvailableCommand
 	IncludeTranscript      bool
@@ -744,7 +745,27 @@ func (b *Bridge) rebindSession(id, cwd string, additionalDirectories []string, m
 	defer b.mu.Unlock()
 	state := b.sessions[id]
 	if state == nil {
-		return nil, notFound("session not found", id)
+		if !b.spec.LoadUnknownSessions {
+			return nil, notFound("session not found", id)
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil, &acp.RPCError{Code: -32602, Message: "session id is required"}
+		}
+		now := b.now()
+		state = &sessionState{Session: Session{
+			ID:                    id,
+			CWD:                   strings.TrimSpace(cwd),
+			AdditionalDirectories: cloneStrings(additionalDirectories),
+			MCPServers:            cloneMCPServers(mcpServers),
+			Config:                defaultConfig(b.spec.Options),
+			CreatedAt:             now,
+			UpdatedAt:             now,
+		}}
+		b.sessions[id] = state
+		cwd = ""
+		additionalDirectories = nil
+		mcpServers = nil
 	}
 	if cwd = strings.TrimSpace(cwd); cwd != "" {
 		state.CWD = cwd

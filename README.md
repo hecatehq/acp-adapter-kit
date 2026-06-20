@@ -36,7 +36,10 @@ Adapters have two runtime integration paths:
   changes, publishing `session_info_update` notifications when transcript
   metadata changes, translating structured command streams into ACP updates
   when a parser is configured, and optionally prepending a bounded transcript
-  prelude to later prompt commands.
+  prelude to later prompt commands. Adapters for CLIs with native session ids
+  may opt into adopting unknown `session/load` or `session/resume` ids so the
+  provider command can continue a session known to the host after an adapter
+  process restart.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

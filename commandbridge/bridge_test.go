@@ -471,6 +471,92 @@ func TestBridgeLoadSessionRejectsStaleID(t *testing.T) {
 	}
 }
 
+func TestBridgeLoadUnknownSessionAdoptsNativeIDWhenEnabled(t *testing.T) {
+	const nativeID = "550e8400-e29b-41d4-a716-446655440000"
+	generatedIDs := 0
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string {
+			generatedIDs++
+			return "generated-session"
+		},
+		LoadUnknownSessions: true,
+		Options: []commandbridge.SelectConfigOption{{
+			ID:           "model",
+			Name:         "Model",
+			DefaultValue: "default",
+			Options: []commandbridge.SelectValue{
+				{Value: "default", Name: "Default"},
+				{Value: "smart", Name: "Smart"},
+			},
+		}},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			if session.ID != nativeID ||
+				session.CWD != "/tmp/reloaded" ||
+				session.Config["model"] != "default" ||
+				len(session.AdditionalDirectories) != 1 ||
+				session.AdditionalDirectories[0] != "/tmp/shared" {
+				t.Fatalf("session = %#v, want adopted native id with loaded workspace state", session)
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{session.ID, text}, Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			if spec.Command != "agent" || spec.Dir != "/tmp/reloaded" || strings.Join(spec.Args, " ") != nativeID+" hello" {
+				t.Fatalf("process spec = %#v, want adopted native session id", spec)
+			}
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	loaded := client.Request("session/load", map[string]any{
+		"sessionId":             nativeID,
+		"cwd":                   "/tmp/reloaded",
+		"additionalDirectories": []string{"/tmp/shared"},
+	})
+	var loadResult struct {
+		ConfigOptions []struct {
+			ID           string `json:"id"`
+			CurrentValue string `json:"currentValue"`
+		} `json:"configOptions"`
+	}
+	loaded.ResultInto(t, &loadResult)
+	if len(loadResult.ConfigOptions) != 1 || loadResult.ConfigOptions[0].CurrentValue != "default" {
+		t.Fatalf("load result = %#v, want default config for adopted session", loadResult.ConfigOptions)
+	}
+	if generatedIDs != 0 {
+		t.Fatalf("generated ids = %d, want load to adopt requested id", generatedIDs)
+	}
+
+	listed := client.Request("session/list", map[string]any{"cwd": "/tmp/reloaded"})
+	var listResult struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+			CWD       string `json:"cwd"`
+		} `json:"sessions"`
+	}
+	listed.ResultInto(t, &listResult)
+	if len(listResult.Sessions) != 1 || listResult.Sessions[0].SessionID != nativeID || listResult.Sessions[0].CWD != "/tmp/reloaded" {
+		t.Fatalf("listed sessions = %#v, want adopted native session", listResult.Sessions)
+	}
+
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": nativeID,
+			"prompt":    []map[string]any{{"type": "text", "text": "hello"}},
+		},
+	})
+	if len(responses) != 4 {
+		t.Fatalf("responses = %#v, want prompt lifecycle", responses)
+	}
+}
+
 func TestBridgeForkSessionClonesConfigAndSeparatesState(t *testing.T) {
 	next := 0
 	bridge := commandbridge.New(commandbridge.Spec{
