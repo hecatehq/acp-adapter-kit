@@ -327,6 +327,154 @@ func TestBridgeParsesStructuredStreamIntoACPUpdates(t *testing.T) {
 	}
 }
 
+func TestBridgeRequestsPermissionForStructuredStreamTool(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				switch event["type"] {
+				case "permission":
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{
+						commandbridge.ToolCallPermissionRequest("tool-1", "Run tests", "execute", map[string]any{"command": "go test ./..."}, nil),
+					}}, nil
+				case "message":
+					return commandbridge.JSONLMapping{
+						Events:         []commandbridge.StreamEvent{commandbridge.AgentMessageChunk("allowed")},
+						TranscriptText: "allowed",
+					}, nil
+				default:
+					return commandbridge.JSONLMapping{}, nil
+				}
+			})
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			stream := strings.Join([]string{
+				`{"type":"permission"}`,
+				`{"type":"message"}`,
+				"",
+			}, "\n")
+			if err := onStdout([]byte(stream)); err != nil {
+				return adapterprocess.Result{Stdout: []byte(stream)}, err
+			}
+			return adapterprocess.Result{Stdout: []byte(stream)}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.SendRaw(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
+		`{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}`,
+	}, "\n") + "\n")
+	if len(responses) != 5 {
+		t.Fatalf("got %d responses, want command start + permission request + message + command finish + prompt response: %#v", len(responses), responses)
+	}
+	start := decodeCommandToolUpdate(t, responses[0])
+	if start.Update.SessionUpdate != "tool_call" || start.Update.Title != "Run agent" {
+		t.Fatalf("start = %#v, want outer command tool start", start)
+	}
+	permission := decodePermissionRequest(t, responses[1])
+	if string(responses[1].ID) != `"server-1"` ||
+		permission.SessionID != "session-1" ||
+		permission.ToolCall.ToolCallID != "tool-1" ||
+		permission.ToolCall.Title != "Run tests" ||
+		permission.ToolCall.Kind != "execute" ||
+		permission.ToolCall.Status != "pending" ||
+		permission.ToolCall.RawInput["command"] != "go test ./..." {
+		t.Fatalf("permission = %#v, want pending tool permission request", permission)
+	}
+	if len(permission.Options) != 2 ||
+		permission.Options[0].OptionID != "allow_once" ||
+		permission.Options[0].Kind != "allow_once" ||
+		permission.Options[1].OptionID != "reject_once" ||
+		permission.Options[1].Kind != "reject_once" {
+		t.Fatalf("permission options = %#v, want default allow/reject options", permission.Options)
+	}
+	message := decodeAgentChunk(t, responses[2])
+	if message.Update.Content.Text != "allowed" {
+		t.Fatalf("message = %#v, want allowed stream after permission", message)
+	}
+	finish := decodeCommandToolUpdate(t, responses[3])
+	if finish.Update.Status != "completed" {
+		t.Fatalf("finish = %#v, want completed command", finish)
+	}
+	var promptResult struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[4].ResultInto(t, &promptResult)
+	if promptResult.StopReason != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn", promptResult.StopReason)
+	}
+}
+
+func TestBridgeRejectsPermissionForStructuredStreamTool(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				if event["type"] != "permission" {
+					return commandbridge.JSONLMapping{}, nil
+				}
+				return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{
+					commandbridge.ToolCallPermissionRequest("tool-1", "Run rm", "execute", map[string]any{"command": "rm -rf tmp"}, []commandbridge.PermissionOption{
+						{OptionID: "allow", Name: "Allow", Kind: "allow_once"},
+						{OptionID: "reject", Name: "Reject", Kind: "reject_once"},
+					}),
+				}}, nil
+			})
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			stream := `{"type":"permission"}` + "\n"
+			if err := onStdout([]byte(stream)); err != nil {
+				return adapterprocess.Result{Stdout: []byte(stream)}, err
+			}
+			return adapterprocess.Result{Stdout: []byte(stream)}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.SendRaw(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
+		`{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"reject"}}}`,
+	}, "\n") + "\n")
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want command start + permission request + command finish + prompt error: %#v", len(responses), responses)
+	}
+	permission := decodePermissionRequest(t, responses[1])
+	if permission.ToolCall.ToolCallID != "tool-1" || permission.Options[1].OptionID != "reject" {
+		t.Fatalf("permission = %#v, want custom reject option", permission)
+	}
+	finish := decodeCommandToolUpdate(t, responses[2])
+	if finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "permission rejected for Run rm") {
+		t.Fatalf("finish = %#v, want failed rejected command", finish)
+	}
+	if responses[3].Error == nil ||
+		responses[3].Error.Code != -32000 ||
+		responses[3].Error.Message != "prompt command failed" {
+		t.Fatalf("prompt response error = %#v, want prompt command failed", responses[3].Error)
+	}
+	raw, _ := json.Marshal(responses[3].Error.Data)
+	if !bytes.Contains(raw, []byte("permission rejected for Run rm")) {
+		t.Fatalf("error data = %s, want permission rejection", raw)
+	}
+}
+
 func TestBridgeUsesStructuredStreamStopReason(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
@@ -1291,6 +1439,32 @@ func decodeUsageUpdate(t testing.TB, response acptest.Response) usageUpdate {
 		t.Fatalf("session update = %q, want usage_update", update.Update.SessionUpdate)
 	}
 	return update
+}
+
+type permissionRequest struct {
+	SessionID string `json:"sessionId"`
+	ToolCall  struct {
+		ToolCallID string         `json:"toolCallId"`
+		Title      string         `json:"title"`
+		Kind       string         `json:"kind"`
+		Status     string         `json:"status"`
+		RawInput   map[string]any `json:"rawInput"`
+	} `json:"toolCall"`
+	Options []struct {
+		OptionID string `json:"optionId"`
+		Name     string `json:"name"`
+		Kind     string `json:"kind"`
+	} `json:"options"`
+}
+
+func decodePermissionRequest(t testing.TB, response acptest.Response) permissionRequest {
+	t.Helper()
+	if response.Method != "session/request_permission" {
+		t.Fatalf("response method = %q, want session/request_permission", response.Method)
+	}
+	var req permissionRequest
+	response.ParamsInto(t, &req)
+	return req
 }
 
 type availableCommandsUpdate struct {
