@@ -14,6 +14,8 @@ This module intentionally contains provider-neutral pieces only:
 - process launching and bounded output capture;
 - provider-neutral doctor command runner support;
 - fake runtime and protocol test utilities.
+- reusable adapter conformance assertions for provider-neutral initialize,
+  capability, and auth surface checks.
 
 Adapter repositories should keep provider-specific behavior local, including
 binary names, capabilities, environment allowlists, doctor wording, launch
