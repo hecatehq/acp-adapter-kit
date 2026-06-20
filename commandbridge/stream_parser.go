@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
 )
 
 type StreamParser interface {
 	Parse([]byte) ([]StreamEvent, error)
 	Flush() ([]StreamEvent, error)
 	Transcript() string
+	StopReason() runtimeacp.StopReason
 }
 
 type StreamEvent struct {
@@ -19,6 +22,7 @@ type StreamEvent struct {
 type JSONLMapping struct {
 	Events         []StreamEvent
 	TranscriptText string
+	StopReason     runtimeacp.StopReason
 }
 
 type JSONLMapper func(map[string]any) (JSONLMapping, error)
@@ -27,6 +31,7 @@ type JSONLStreamParser struct {
 	mapper     JSONLMapper
 	buffer     []byte
 	transcript strings.Builder
+	stopReason runtimeacp.StopReason
 }
 
 func NewJSONLStreamParser(mapper JSONLMapper) *JSONLStreamParser {
@@ -76,6 +81,13 @@ func (p *JSONLStreamParser) Transcript() string {
 	return p.transcript.String()
 }
 
+func (p *JSONLStreamParser) StopReason() runtimeacp.StopReason {
+	if p == nil {
+		return ""
+	}
+	return p.stopReason
+}
+
 func (p *JSONLStreamParser) mapLine(line []byte) ([]StreamEvent, error) {
 	if strings.TrimSpace(string(line)) == "" {
 		return nil, nil
@@ -93,6 +105,9 @@ func (p *JSONLStreamParser) mapLine(line []byte) ([]StreamEvent, error) {
 	}
 	if mapping.TranscriptText != "" {
 		p.transcript.WriteString(mapping.TranscriptText)
+	}
+	if mapping.StopReason != "" {
+		p.stopReason = mapping.StopReason
 	}
 	return mapping.Events, nil
 }

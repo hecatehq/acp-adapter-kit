@@ -443,7 +443,13 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
 	}
-	return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonEndTurn}, nil
+	stopReason := runtimeacp.StopReasonEndTurn
+	if parser != nil {
+		if parsed := parser.StopReason(); parsed != "" {
+			stopReason = parsed
+		}
+	}
+	return runtimeacp.PromptResult{StopReason: stopReason}, nil
 }
 
 func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec, parser StreamParser) (adapterprocess.Result, string, error) {
