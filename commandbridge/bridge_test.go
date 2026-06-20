@@ -1042,6 +1042,76 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	}
 }
 
+func TestBridgePassesPromptLifecycleStateToCommandBuilder(t *testing.T) {
+	ids := []string{"session-1", "session-2"}
+	var nextID int
+	var seen []commandbridge.Session
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string {
+			id := ids[nextID]
+			nextID++
+			return id
+		},
+		IncludeTranscript: true,
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			if _, err := commandbridge.RequirePromptText(params); err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			seen = append(seen, session)
+			return adapterprocess.Spec{Command: "agent", Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	client.Send(promptRequest(2, "session-1", "first"))
+	client.Send(promptRequest(3, "session-1", "second"))
+	client.Request("session/fork", map[string]any{"sessionId": "session-1", "cwd": "/tmp/fork"})
+	client.Send(promptRequest(5, "session-2", "forked"))
+
+	if len(seen) != 3 {
+		t.Fatalf("seen sessions = %#v, want three prompt builds", seen)
+	}
+	if seen[0].ID != "session-1" || seen[0].PromptCount != 0 || seen[0].Adopted {
+		t.Fatalf("first prompt session = %#v, want fresh session", seen[0])
+	}
+	if seen[1].ID != "session-1" || seen[1].PromptCount != 1 || seen[1].Adopted {
+		t.Fatalf("second prompt session = %#v, want one successful prior prompt", seen[1])
+	}
+	if seen[2].ID != "session-2" || seen[2].PromptCount != 0 || seen[2].Adopted {
+		t.Fatalf("fork prompt session = %#v, want new runtime session despite copied transcript", seen[2])
+	}
+}
+
+func TestBridgePassesAdoptedStateForLoadedUnknownSession(t *testing.T) {
+	const nativeID = "native-session"
+	var seen commandbridge.Session
+	bridge := commandbridge.New(commandbridge.Spec{
+		LoadUnknownSessions: true,
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			if _, err := commandbridge.RequirePromptText(params); err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			seen = session
+			return adapterprocess.Spec{Command: "agent", Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	client.Request("session/load", map[string]any{"sessionId": nativeID, "cwd": "/tmp/reloaded"})
+	client.Send(promptRequest(2, nativeID, "loaded"))
+
+	if seen.ID != nativeID || seen.PromptCount != 0 || !seen.Adopted {
+		t.Fatalf("loaded prompt session = %#v, want adopted session with no local prompt history", seen)
+	}
+}
+
 func TestBridgeCancelStopsStreamingPromptWithoutRecordingTranscript(t *testing.T) {
 	started := make(chan struct{})
 	var prompts []string

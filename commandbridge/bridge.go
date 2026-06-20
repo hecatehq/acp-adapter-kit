@@ -86,6 +86,10 @@ type Session struct {
 	Title                 string
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
+	// PromptCount counts successful prompt commands run for this ACP session ID.
+	PromptCount int
+	// Adopted is true when the bridge adopted a host-known session ID via load/resume.
+	Adopted bool
 }
 
 type SelectConfigOption struct {
@@ -438,6 +442,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		}
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
 	}
+	b.recordPromptSuccess(req.SessionID)
 	if info, ok := b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText); ok {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
@@ -552,6 +557,16 @@ func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText str
 		state.transcript = append([]transcriptExchange(nil), state.transcript[len(state.transcript)-max:]...)
 	}
 	return sessionInfo{Title: state.Title, UpdatedAt: state.UpdatedAt}, true
+}
+
+func (b *Bridge) recordPromptSuccess(sessionID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.sessions[sessionID]
+	if state == nil {
+		return
+	}
+	state.PromptCount++
 }
 
 func sessionTitle(text string) string {
@@ -952,6 +967,7 @@ func (b *Bridge) rebindSession(id, cwd string, additionalDirectories []string, m
 			Config:                defaultConfig(b.spec.Options),
 			CreatedAt:             now,
 			UpdatedAt:             now,
+			Adopted:               true,
 		}}
 		b.sessions[id] = state
 		cwd = ""
