@@ -43,6 +43,8 @@ func (ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, on
 
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
 
+type LogoutCommandBuilder func() (adapterprocess.Spec, error)
+
 type Spec struct {
 	Runner                 Runner
 	NewID                  func() string
@@ -52,6 +54,7 @@ type Spec struct {
 	IncludeTranscript      bool
 	MaxTranscriptExchanges int
 	BuildPrompt            PromptCommandBuilder
+	BuildLogout            LogoutCommandBuilder
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 	Now                    func() time.Time
 }
@@ -135,7 +138,7 @@ func (b *Bridge) Options() []acp.Option {
 	if b == nil {
 		return nil
 	}
-	return []acp.Option{
+	options := []acp.Option{
 		acp.WithMethod("session/new", b.newSession),
 		acp.WithMethod("session/fork", b.forkSession),
 		acp.WithMethod("session/load", b.loadSession),
@@ -149,6 +152,28 @@ func (b *Bridge) Options() []acp.Option {
 		acp.WithMethod("session/delete", b.deleteSession),
 		acp.WithNotification("session/cancel", b.cancelNotification),
 	}
+	if b.spec.BuildLogout != nil {
+		options = append(options, acp.WithMethod("logout", b.logout))
+	}
+	return options
+}
+
+func (b *Bridge) logout(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req map[string]any
+	if len(params) != 0 && string(params) != "null" {
+		if rpcErr := decodeParams(params, &req); rpcErr != nil {
+			return nil, rpcErr
+		}
+	}
+	command, err := b.spec.BuildLogout()
+	if err != nil {
+		return nil, invalidParams("build logout command", err.Error())
+	}
+	result, err := b.spec.Runner.Run(methodContext(ctx), command)
+	if err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "logout command failed", Data: commandErrorData(result, err)}
+	}
+	return map[string]any{}, nil
 }
 
 func (b *Bridge) newSession(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {

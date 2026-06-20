@@ -879,6 +879,51 @@ func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	}
 }
 
+func TestBridgeRunsLogoutCommand(t *testing.T) {
+	var saw adapterprocess.Spec
+	bridge := commandbridge.New(commandbridge.Spec{
+		BuildLogout: func() (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent", Args: []string{"logout"}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			saw = spec
+			return adapterprocess.Result{Stdout: []byte("logged out\n")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	resp := client.Request("logout", map[string]any{})
+	var result map[string]any
+	resp.ResultInto(t, &result)
+	if len(result) != 0 {
+		t.Fatalf("logout result = %#v, want empty object", result)
+	}
+	if saw.Command != "agent" || strings.Join(saw.Args, " ") != "logout" {
+		t.Fatalf("logout command = %#v, want agent logout", saw)
+	}
+}
+
+func TestBridgeLogoutCommandErrorMapsToRPCError(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		BuildLogout: func() (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent", Args: []string{"logout"}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stderr: []byte("not signed in")}, errors.New("exit 1")
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	resp := client.Request("logout", map[string]any{})
+	if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != "logout command failed" {
+		t.Fatalf("response error = %#v, want logout command failure", resp.Error)
+	}
+	raw, _ := json.Marshal(resp.Error.Data)
+	if !bytes.Contains(raw, []byte("not signed in")) {
+		t.Fatalf("error data = %s, want stderr", raw)
+	}
+}
+
 func server(bridge *commandbridge.Bridge) *acp.Server {
 	return acp.NewServer(acp.AdapterInfo{
 		Name:  "test-command-adapter",
