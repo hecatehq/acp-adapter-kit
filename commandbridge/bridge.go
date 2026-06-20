@@ -43,17 +43,21 @@ func (ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, on
 
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
 
+type AuthenticateCommandBuilder func(methodID string) (adapterprocess.Spec, error)
+
 type LogoutCommandBuilder func() (adapterprocess.Spec, error)
 
 type Spec struct {
 	Runner                 Runner
 	NewID                  func() string
 	LoadUnknownSessions    bool
+	AuthMethods            []acp.AuthMethod
 	Options                []SelectConfigOption
 	Commands               []AvailableCommand
 	IncludeTranscript      bool
 	MaxTranscriptExchanges int
 	BuildPrompt            PromptCommandBuilder
+	BuildAuthenticate      AuthenticateCommandBuilder
 	BuildLogout            LogoutCommandBuilder
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 	Now                    func() time.Time
@@ -153,9 +157,49 @@ func (b *Bridge) Options() []acp.Option {
 		acp.WithNotification("session/cancel", b.cancelNotification),
 	}
 	if b.spec.BuildLogout != nil {
+		options = append(options, acp.WithAuthLogout())
 		options = append(options, acp.WithMethod("logout", b.logout))
 	}
+	if b.spec.BuildAuthenticate != nil {
+		options = append(options, acp.WithAuthMethods(b.spec.AuthMethods))
+		options = append(options, acp.WithMethod("authenticate", b.authenticate))
+	}
 	return options
+}
+
+func (b *Bridge) authenticate(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+	var req runtimeacp.AuthenticateParams
+	if rpcErr := decodeParams(params, &req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	methodID := strings.TrimSpace(req.MethodID)
+	if methodID == "" {
+		return nil, invalidParams("methodId is required", nil)
+	}
+	if !b.authMethodAllowed(methodID) {
+		return nil, invalidParams("unknown auth method", methodID)
+	}
+	command, err := b.spec.BuildAuthenticate(methodID)
+	if err != nil {
+		return nil, invalidParams("build authenticate command", err.Error())
+	}
+	result, err := b.spec.Runner.Run(methodContext(ctx), command)
+	if err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "authenticate command failed", Data: commandErrorData(result, err)}
+	}
+	return map[string]any{}, nil
+}
+
+func (b *Bridge) authMethodAllowed(methodID string) bool {
+	if len(b.spec.AuthMethods) == 0 {
+		return false
+	}
+	for _, method := range b.spec.AuthMethods {
+		if method.ID == methodID {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) logout(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {

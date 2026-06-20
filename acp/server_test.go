@@ -93,6 +93,45 @@ func TestInitializeCanUseRuntimeResult(t *testing.T) {
 	}
 }
 
+func TestInitializeAdvertisesAuthMethodsAndLogout(t *testing.T) {
+	server := NewServer(
+		AdapterInfo{Name: "codex-acp-adapter"},
+		WithAuthMethods([]AuthMethod{{
+			ID:          "agent-login",
+			Name:        "Agent login",
+			Description: "Sign in using the agent CLI.",
+		}}),
+		WithAuthLogout(),
+	)
+
+	var out bytes.Buffer
+	err := server.Serve(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"), &out)
+	if err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+
+	envelopes := decodeServerEnvelopes(t, out.Bytes())
+	var result struct {
+		AgentCapabilities struct {
+			Auth struct {
+				Logout map[string]any `json:"logout"`
+			} `json:"auth"`
+		} `json:"agentCapabilities"`
+		AuthMethods []AuthMethod `json:"authMethods"`
+	}
+	if err := json.Unmarshal(envelopes[0].Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if result.AgentCapabilities.Auth.Logout == nil {
+		t.Fatalf("auth.logout = nil, want advertised empty object")
+	}
+	if len(result.AuthMethods) != 1 ||
+		result.AuthMethods[0].ID != "agent-login" ||
+		result.AuthMethods[0].Name != "Agent login" {
+		t.Fatalf("authMethods = %#v, want agent-login", result.AuthMethods)
+	}
+}
+
 func TestInitializeHandlerReceivesClientParams(t *testing.T) {
 	server := NewServer(AdapterInfo{Name: "codex-acp-adapter"}, WithInitializeHandler(func(params json.RawMessage) (any, *RPCError) {
 		var req struct {

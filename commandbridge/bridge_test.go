@@ -903,6 +903,87 @@ func TestBridgeRunsLogoutCommand(t *testing.T) {
 	}
 }
 
+func TestBridgeAdvertisesAndRunsAuthenticateCommand(t *testing.T) {
+	var saw adapterprocess.Spec
+	var sawMethodID string
+	bridge := commandbridge.New(commandbridge.Spec{
+		AuthMethods: []acp.AuthMethod{{
+			ID:          "agent-login",
+			Name:        "Agent login",
+			Description: "Sign in using the agent CLI.",
+		}},
+		BuildAuthenticate: func(methodID string) (adapterprocess.Spec, error) {
+			sawMethodID = methodID
+			return adapterprocess.Spec{Command: "agent", Args: []string{"login"}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+			saw = spec
+			return adapterprocess.Result{Stdout: []byte("logged in\n")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	initialize := client.Request("initialize", map[string]any{})
+	var initResult struct {
+		AuthMethods []acp.AuthMethod `json:"authMethods"`
+	}
+	initialize.ResultInto(t, &initResult)
+	if len(initResult.AuthMethods) != 1 || initResult.AuthMethods[0].ID != "agent-login" {
+		t.Fatalf("authMethods = %#v, want agent-login", initResult.AuthMethods)
+	}
+
+	resp := client.Request("authenticate", map[string]any{"methodId": "agent-login"})
+	var result map[string]any
+	resp.ResultInto(t, &result)
+	if len(result) != 0 {
+		t.Fatalf("authenticate result = %#v, want empty object", result)
+	}
+	if sawMethodID != "agent-login" {
+		t.Fatalf("methodID = %q, want agent-login", sawMethodID)
+	}
+	if saw.Command != "agent" || strings.Join(saw.Args, " ") != "login" {
+		t.Fatalf("authenticate command = %#v, want agent login", saw)
+	}
+}
+
+func TestBridgeAuthenticateRejectsUnknownMethod(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		AuthMethods: []acp.AuthMethod{{ID: "agent-login"}},
+		BuildAuthenticate: func(string) (adapterprocess.Spec, error) {
+			t.Fatal("BuildAuthenticate should not be called for unknown method")
+			return adapterprocess.Spec{}, nil
+		},
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	resp := client.Request("authenticate", map[string]any{"methodId": "browser-login"})
+	if resp.Error == nil || resp.Error.Code != -32602 || resp.Error.Message != "unknown auth method" {
+		t.Fatalf("response error = %#v, want unknown auth method", resp.Error)
+	}
+}
+
+func TestBridgeAuthenticateCommandErrorMapsToRPCError(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		AuthMethods: []acp.AuthMethod{{ID: "agent-login"}},
+		BuildAuthenticate: func(string) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent", Args: []string{"login"}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stderr: []byte("login refused")}, errors.New("exit 1")
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+
+	resp := client.Request("authenticate", map[string]any{"methodId": "agent-login"})
+	if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != "authenticate command failed" {
+		t.Fatalf("response error = %#v, want authenticate command failure", resp.Error)
+	}
+	raw, _ := json.Marshal(resp.Error.Data)
+	if !bytes.Contains(raw, []byte("login refused")) {
+		t.Fatalf("error data = %s, want stderr", raw)
+	}
+}
+
 func TestBridgeLogoutCommandErrorMapsToRPCError(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		BuildLogout: func() (adapterprocess.Spec, error) {

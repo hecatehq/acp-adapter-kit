@@ -31,10 +31,19 @@ type Capabilities struct {
 	LoadSession     bool
 }
 
+type AuthMethod struct {
+	ID          string `json:"id"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Type        string `json:"type,omitempty"`
+}
+
 type Server struct {
 	info              AdapterInfo
 	initialize        any
 	initializeHandler InitializeHandler
+	authMethods       []AuthMethod
+	authLogout        bool
 	methods           map[string]MethodHandler
 	concurrent        map[string]bool
 	notifications     map[string]NotificationHandler
@@ -128,6 +137,18 @@ func WithInitializeResult(result any) Option {
 func WithInitializeHandler(handler InitializeHandler) Option {
 	return func(s *Server) {
 		s.initializeHandler = handler
+	}
+}
+
+func WithAuthMethods(methods []AuthMethod) Option {
+	return func(s *Server) {
+		s.authMethods = append([]AuthMethod(nil), methods...)
+	}
+}
+
+func WithAuthLogout() Option {
+	return func(s *Server) {
+		s.authLogout = true
 	}
 }
 
@@ -300,13 +321,14 @@ func (s *Server) handle(ctx *MethodContext, req request) response {
 					HTTP: s.info.Capabilities.MCPHTTP,
 					SSE:  s.info.Capabilities.MCPSSE,
 				},
+				Auth: authCapabilitiesFromServer(s),
 			},
 			AgentInfo: agentInfo{
 				Name:    s.info.Name,
 				Title:   s.info.Title,
 				Version: s.info.Version,
 			},
-			AuthMethods: []authMethod{},
+			AuthMethods: append([]AuthMethod{}, s.authMethods...),
 		})
 	case "authenticate",
 		"document/didChange",
@@ -403,14 +425,21 @@ type initializeResult struct {
 	ProtocolVersion   int               `json:"protocolVersion"`
 	AgentCapabilities agentCapabilities `json:"agentCapabilities"`
 	AgentInfo         agentInfo         `json:"agentInfo"`
-	AuthMethods       []authMethod      `json:"authMethods"`
+	AuthMethods       []AuthMethod      `json:"authMethods"`
 }
 
 type agentCapabilities struct {
 	LoadSession        bool               `json:"loadSession,omitempty"`
 	PromptCapabilities promptCapabilities `json:"promptCapabilities"`
 	MCPCapabilities    mcpCapabilities    `json:"mcpCapabilities"`
+	Auth               *authCapabilities  `json:"auth,omitempty"`
 }
+
+type authCapabilities struct {
+	Logout *emptyObject `json:"logout,omitempty"`
+}
+
+type emptyObject struct{}
 
 type promptCapabilities struct {
 	Image           bool `json:"image"`
@@ -428,7 +457,12 @@ type agentInfo struct {
 	Version string `json:"version"`
 }
 
-type authMethod struct{}
+func authCapabilitiesFromServer(s *Server) *authCapabilities {
+	if s == nil || !s.authLogout {
+		return nil
+	}
+	return &authCapabilities{Logout: &emptyObject{}}
+}
 
 type connection struct {
 	scanner   *bufio.Scanner

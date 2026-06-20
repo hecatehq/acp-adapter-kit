@@ -39,7 +39,9 @@ Adapters have two runtime integration paths:
   prelude to later prompt commands. Adapters for CLIs with native session ids
   may opt into adopting unknown `session/load` or `session/resume` ids so the
   provider command can continue a session known to the host after an adapter
-  process restart.
+  process restart. Command-backed adapters can also advertise ACP
+  `authMethods`, run a fixed-argv native login command for `authenticate`, and
+  advertise/run ACP `logout` when the provider CLI supports ending local auth.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.
