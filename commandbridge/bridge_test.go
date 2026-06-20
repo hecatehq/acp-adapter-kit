@@ -327,6 +327,64 @@ func TestBridgeParsesStructuredStreamIntoACPUpdates(t *testing.T) {
 	}
 }
 
+func TestBridgeUsesStructuredStreamStopReason(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				switch event["type"] {
+				case "message":
+					text, _ := event["text"].(string)
+					return commandbridge.JSONLMapping{
+						Events:         []commandbridge.StreamEvent{commandbridge.AgentMessageChunk(text)},
+						TranscriptText: text,
+					}, nil
+				case "done":
+					return commandbridge.JSONLMapping{StopReason: runtimeacp.StopReasonMaxTokens}, nil
+				default:
+					return commandbridge.JSONLMapping{}, nil
+				}
+			})
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			stream := strings.Join([]string{
+				`{"type":"message","text":"partial"}`,
+				`{"type":"done"}`,
+				"",
+			}, "\n")
+			if err := onStdout([]byte(stream)); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			return adapterprocess.Result{Stdout: []byte(stream)}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "hello"))
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want command start + message + finish + prompt response: %#v", len(responses), responses)
+	}
+	message := decodeAgentChunk(t, responses[1])
+	if message.Update.Content.Text != "partial" {
+		t.Fatalf("message = %#v, want parsed partial text", message)
+	}
+	var promptResult struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[3].ResultInto(t, &promptResult)
+	if promptResult.StopReason != "max_tokens" {
+		t.Fatalf("stop reason = %q, want max_tokens", promptResult.StopReason)
+	}
+}
+
 func TestBridgePublishesSessionInfoAfterTranscriptPrompt(t *testing.T) {
 	base := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	ticks := 0
