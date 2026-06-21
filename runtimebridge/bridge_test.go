@@ -350,6 +350,85 @@ func TestPromptForwardsRuntimeMCPChildRequestAndReturnsClientResponse(t *testing
 	}
 }
 
+func TestPromptForwardsRuntimeTerminalChildRequests(t *testing.T) {
+	tests := []struct {
+		method       string
+		params       json.RawMessage
+		clientResult string
+		wantResult   string
+	}{
+		{
+			method:       "terminal/create",
+			params:       json.RawMessage(`{"sessionId":"sess-bridge","command":"sh","args":["-c","printf ok"],"cwd":"/tmp/project","outputByteLimit":128}`),
+			clientResult: `{"terminalId":"term-1"}`,
+			wantResult:   `"terminalId":"term-1"`,
+		},
+		{
+			method:       "terminal/output",
+			params:       json.RawMessage(`{"sessionId":"sess-bridge","terminalId":"term-1"}`),
+			clientResult: `{"output":"ok\n","truncated":false,"exitStatus":{"exitCode":0}}`,
+			wantResult:   `"output":"ok\n"`,
+		},
+		{
+			method:       "terminal/wait_for_exit",
+			params:       json.RawMessage(`{"sessionId":"sess-bridge","terminalId":"term-1"}`),
+			clientResult: `{"exitCode":0}`,
+			wantResult:   `"exitCode":0`,
+		},
+		{
+			method:       "terminal/kill",
+			params:       json.RawMessage(`{"sessionId":"sess-bridge","terminalId":"term-1"}`),
+			clientResult: `{}`,
+			wantResult:   `{}`,
+		},
+		{
+			method:       "terminal/release",
+			params:       json.RawMessage(`{"sessionId":"sess-bridge","terminalId":"term-1"}`),
+			clientResult: `{}`,
+			wantResult:   `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			runtime := newFakeRuntimeClient()
+			runtime.childRequest = true
+			runtime.childRequestMethod = tt.method
+			runtime.childRequestParams = tt.params
+			client := newBridgeClient(t, runtime)
+
+			envelopes := client.SendRaw(strings.Join([]string{
+				`{"jsonrpc":"2.0","id":"prompt-1","method":"session/prompt","params":{"sessionId":"sess-bridge","prompt":[{"type":"text","text":"needs terminal"}]}}`,
+				`{"jsonrpc":"2.0","id":"server-1","result":` + tt.clientResult + `}`,
+			}, "\n") + "\n")
+			if len(envelopes) != 2 {
+				t.Fatalf("got %d envelopes, want terminal child request + prompt response", len(envelopes))
+			}
+			if envelopes[0].Method != tt.method {
+				t.Fatalf("child request method = %q, want %s", envelopes[0].Method, tt.method)
+			}
+			if string(envelopes[0].Params) != string(tt.params) {
+				t.Fatalf("child request params = %s, want %s", envelopes[0].Params, tt.params)
+			}
+			var result struct {
+				StopReason string `json:"stopReason"`
+			}
+			envelopes[1].ResultInto(t, &result)
+			if result.StopReason != "end_turn" {
+				t.Fatalf("stopReason = %q, want end_turn", result.StopReason)
+			}
+
+			response := runtime.nextResponse(t)
+			if string(response.id) != `"runtime-child-1"` {
+				t.Fatalf("runtime response id = %s, want runtime-child-1", response.id)
+			}
+			if !strings.Contains(string(response.result), tt.wantResult) {
+				t.Fatalf("runtime response result = %s, want %s", response.result, tt.wantResult)
+			}
+		})
+	}
+}
+
 func TestPromptCancelWhileAwaitingRuntimeChildRequest(t *testing.T) {
 	runtime := newFakeRuntimeClient()
 	runtime.childRequest = true
