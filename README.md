@@ -13,7 +13,8 @@ This module intentionally contains provider-neutral pieces only:
 - runtime bridge and host scaffolding;
 - process launching and bounded output capture;
 - provider-neutral doctor command runner support;
-- fake runtime and protocol test utilities.
+- fake runtime and protocol test utilities;
+- reusable live ACP test client utilities for opt-in integration smoke tests;
 - reusable adapter conformance assertions for provider-neutral initialize,
   capability, auth, session selector, and available-command checks.
 
