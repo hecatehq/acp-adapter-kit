@@ -32,18 +32,19 @@ Adapters have two runtime integration paths:
 - `commandbridge` owns lightweight ACP sessions in Go and invokes a configured
   local command for each prompt, emitting a generic `tool_call` activity around
   the command, forwarding stdout as assistant text, cancelling the process when
-  ACP `session/cancel` arrives, supporting in-memory `session/load`,
-  `session/resume`, and `session/fork`, returning command-backed session list
-  metadata, treating ACP `session/close` as active-work cancellation plus
-  in-memory session cleanup, publishing `config_option_update` notifications after config
-  changes, publishing `session_info_update` notifications when transcript
-  metadata changes, translating structured command streams into ACP updates
-  when a parser is configured, requesting ACP tool permissions from parsed
-  stream events before continuing, and optionally prepending a bounded
-  transcript prelude to later prompt commands. Adapters for CLIs with native
-  session ids may opt into adopting unknown `session/load` or `session/resume`
-  ids so the provider command can continue a session known to the host after an
-  adapter process restart. Command-backed adapters can also advertise ACP
+  ACP `session/cancel` arrives, dropping stream chunks delivered after
+  cancellation, supporting in-memory `session/load`, `session/resume`, and
+  `session/fork`, returning command-backed session list metadata, treating ACP
+  `session/close` as active-work cancellation plus in-memory session cleanup,
+  publishing `config_option_update` notifications after config changes,
+  publishing `session_info_update` notifications when transcript metadata
+  changes, translating structured command streams into ACP updates when a
+  parser is configured, requesting ACP tool permissions from parsed stream
+  events before continuing, and optionally prepending a bounded transcript
+  prelude to later prompt commands. Adapters for CLIs with native session ids
+  may opt into adopting unknown `session/load` or `session/resume` ids so the
+  provider command can continue a session known to the host after an adapter
+  process restart. Command-backed adapters can also advertise ACP
   `session/delete` as destructive in-memory session cleanup, advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
