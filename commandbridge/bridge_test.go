@@ -1079,6 +1079,43 @@ func TestBridgeCloseSessionRemovesSessionState(t *testing.T) {
 	}
 }
 
+func TestBridgeDeleteSessionRemovesSessionState(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	deleteResp := client.Request("session/delete", map[string]any{"sessionId": "session-1"})
+	var deleteResult map[string]any
+	deleteResp.ResultInto(t, &deleteResult)
+
+	listResp := client.Request("session/list", map[string]any{})
+	var list struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+		} `json:"sessions"`
+	}
+	listResp.ResultInto(t, &list)
+	if len(list.Sessions) != 0 {
+		t.Fatalf("sessions after delete = %#v, want deleted session removed", list.Sessions)
+	}
+
+	promptResp := client.Request("session/prompt", map[string]any{
+		"sessionId": "session-1",
+		"prompt":    []map[string]any{{"type": "text", "text": "after delete"}},
+	})
+	if promptResp.Error == nil || promptResp.Error.Code != -32001 || promptResp.Error.Message != "session not found" {
+		t.Fatalf("prompt after delete error = %#v, want session not found", promptResp.Error)
+	}
+}
+
 func TestBridgeCloseRequestCancelsActivePromptAndRemovesSession(t *testing.T) {
 	started := make(chan struct{})
 	bridge := commandbridge.New(commandbridge.Spec{
