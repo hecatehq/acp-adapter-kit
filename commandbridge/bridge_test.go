@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -472,6 +474,217 @@ func TestBridgeRejectsPermissionForStructuredStreamTool(t *testing.T) {
 	raw, _ := json.Marshal(responses[3].Error.Data)
 	if !bytes.Contains(raw, []byte("permission rejected for Run rm")) {
 		t.Fatalf("error data = %s, want permission rejection", raw)
+	}
+}
+
+func newPermissionOutcomeTestBridge() *commandbridge.Bridge {
+	return commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				switch event["type"] {
+				case "permission":
+					return commandbridge.JSONLMapping{Events: []commandbridge.StreamEvent{
+						commandbridge.ToolCallPermissionRequest("tool-1", "Run tests", "execute", map[string]any{"command": "go test ./..."}, []commandbridge.PermissionOption{
+							{OptionID: "allow-session", Name: "Allow for session", Kind: "allow_always"},
+							{OptionID: "deny-once", Name: "Deny once", Kind: "reject_once"},
+						}),
+					}}, nil
+				case "message":
+					return commandbridge.JSONLMapping{
+						Events:         []commandbridge.StreamEvent{commandbridge.AgentMessageChunk("allowed")},
+						TranscriptText: "allowed",
+					}, nil
+				default:
+					return commandbridge.JSONLMapping{}, nil
+				}
+			})
+		},
+		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
+		},
+		Runner: streamingRunnerFunc(func(_ context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			stream := strings.Join([]string{
+				`{"type":"permission"}`,
+				`{"type":"message"}`,
+				"",
+			}, "\n")
+			if err := onStdout([]byte(stream)); err != nil {
+				return adapterprocess.Result{Stdout: []byte(stream)}, err
+			}
+			return adapterprocess.Result{Stdout: []byte(stream)}, nil
+		}),
+	})
+}
+
+func TestBridgePermissionOutcomeVariants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		clientResponse string
+		wantAllowed    bool
+		wantError      string
+	}{
+		{
+			name:           "allow always",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"allow-session"}}}`,
+			wantAllowed:    true,
+		},
+		{
+			name:           "reject selected",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"deny-once"}}}`,
+			wantError:      "permission rejected for Run tests",
+		},
+		{
+			name:           "cancelled outcome",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"cancelled"}}}`,
+			wantError:      "permission cancelled for Run tests",
+		},
+		{
+			name:           "unknown selected option",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"allow-forever"}}}`,
+			wantError:      `permission response selected unknown option "allow-forever" for Run tests`,
+		},
+		{
+			name:           "missing selected option",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected"}}}`,
+			wantError:      "permission response missing selected option for Run tests",
+		},
+		{
+			name:           "missing outcome",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","result":{}}`,
+			wantError:      "permission response missing outcome",
+		},
+		{
+			name:           "client rpc error",
+			clientResponse: `{"jsonrpc":"2.0","id":"server-1","error":{"code":-32060,"message":"operator unavailable"}}`,
+			wantError:      "request permission: operator unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bridge := newPermissionOutcomeTestBridge()
+			client := acptest.NewClient(t, server(bridge))
+			client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+			responses := client.SendRaw(strings.Join([]string{
+				`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
+				tt.clientResponse,
+			}, "\n") + "\n")
+			if tt.wantAllowed {
+				if len(responses) != 5 {
+					t.Fatalf("got %d responses, want command start + permission + message + command finish + prompt response: %#v", len(responses), responses)
+				}
+				permission := decodePermissionRequest(t, responses[1])
+				if len(permission.Options) != 2 ||
+					permission.Options[0].OptionID != "allow-session" ||
+					permission.Options[0].Kind != "allow_always" ||
+					permission.Options[1].OptionID != "deny-once" ||
+					permission.Options[1].Kind != "reject_once" {
+					t.Fatalf("permission options = %#v, want allow_always/reject_once", permission.Options)
+				}
+				message := decodeAgentChunk(t, responses[2])
+				if message.Update.Content.Text != "allowed" {
+					t.Fatalf("message = %#v, want allowed stream after permission", message)
+				}
+				finish := decodeCommandToolUpdate(t, responses[3])
+				if finish.Update.Status != "completed" {
+					t.Fatalf("finish = %#v, want completed command", finish)
+				}
+				var result struct {
+					StopReason string `json:"stopReason"`
+				}
+				responses[4].ResultInto(t, &result)
+				if result.StopReason != "end_turn" {
+					t.Fatalf("stop reason = %q, want end_turn", result.StopReason)
+				}
+				return
+			}
+
+			if len(responses) != 4 {
+				t.Fatalf("got %d responses, want command start + permission + command finish + prompt error: %#v", len(responses), responses)
+			}
+			permission := decodePermissionRequest(t, responses[1])
+			if permission.ToolCall.ToolCallID != "tool-1" || permission.ToolCall.Title != "Run tests" {
+				t.Fatalf("permission = %#v, want Run tests request", permission)
+			}
+			finish := decodeCommandToolUpdate(t, responses[2])
+			if finish.Update.Status != "failed" ||
+				!strings.Contains(finish.Update.Content[0].Content.Text, tt.wantError) {
+				t.Fatalf("finish = %#v, want failed command containing %q", finish, tt.wantError)
+			}
+			if responses[3].Error == nil ||
+				responses[3].Error.Code != -32000 ||
+				responses[3].Error.Message != "prompt command failed" {
+				t.Fatalf("prompt response error = %#v, want prompt command failed", responses[3].Error)
+			}
+			raw, _ := json.Marshal(responses[3].Error.Data)
+			if !strings.Contains(fmt.Sprint(responses[3].Error.Data), tt.wantError) {
+				t.Fatalf("error data = %s, want %q", raw, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestBridgePermissionRequestCancelsWithPrompt(t *testing.T) {
+	bridge := newPermissionOutcomeTestBridge()
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	serveDone := make(chan error, 1)
+	go func() {
+		err := server(bridge).Serve(inputReader, outputWriter)
+		_ = outputWriter.Close()
+		serveDone <- err
+	}()
+	decoder := json.NewDecoder(outputReader)
+
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	start := decodeCommandToolUpdate(t, decodeResponse(t, decoder))
+	if start.Update.Status != "in_progress" {
+		t.Fatalf("start = %#v, want running prompt command", start)
+	}
+	permission := decodePermissionRequest(t, decodeResponse(t, decoder))
+	if permission.ToolCall.ToolCallID != "tool-1" {
+		t.Fatalf("permission = %#v, want tool-1 request", permission)
+	}
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"prompt"}}`); err != nil {
+		t.Fatalf("write cancel request: %v", err)
+	}
+	finish := decodeCommandToolUpdate(t, decodeResponse(t, decoder))
+	if finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") {
+		t.Fatalf("finish = %#v, want cancelled failed command", finish)
+	}
+	var result struct {
+		StopReason string `json:"stopReason"`
+	}
+	decodeResponse(t, decoder).ResultInto(t, &result)
+	if result.StopReason != "cancelled" {
+		t.Fatalf("stop reason = %q, want cancelled", result.StopReason)
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serve returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
 	}
 }
 
@@ -1542,6 +1755,15 @@ func promptRequest(id int, sessionID, prompt string) map[string]any {
 			"prompt":    []map[string]any{{"type": "text", "text": prompt}},
 		},
 	}
+}
+
+func decodeResponse(t testing.TB, decoder *json.Decoder) acptest.Response {
+	t.Helper()
+	var response acptest.Response
+	if err := decoder.Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return response
 }
 
 func setConfigOption(t testing.TB, client *acptest.Client, sessionID, configID, value string) (configOptionsUpdate, acptest.Response) {
