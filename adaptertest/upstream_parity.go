@@ -27,10 +27,10 @@ type LoadUnknownSessionContract struct {
 	Allowed   bool
 }
 
-// AssertUpstreamParityContract verifies portable behaviors adapted from the
-// upstream npm/SDK adapter suites: auth method gating, session bootstrap,
-// config mutation shape, session list/load, cancel/close/delete, and unknown
-// session load behavior. Provider-internal SDK tests stay in adapter repos.
+// AssertUpstreamParityContract verifies portable behaviors adapted from prior
+// adapter suites: auth method gating, session bootstrap, config mutation shape,
+// session list/load, cancel/close/delete, and unknown session load behavior.
+// Provider-internal SDK tests stay in adapter repos.
 func AssertUpstreamParityContract(t testing.TB, server *acp.Server, want UpstreamParityContract) {
 	t.Helper()
 	if server == nil {
