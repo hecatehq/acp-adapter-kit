@@ -18,10 +18,15 @@ func TestInitializeResponse(t *testing.T) {
 		Title:   "Codex ACP Adapter",
 		Version: "test",
 		Capabilities: Capabilities{
-			Images:          true,
-			EmbeddedContext: true,
-			MCPHTTP:         true,
-			LoadSession:     true,
+			Images:                true,
+			EmbeddedContext:       true,
+			MCPHTTP:               true,
+			LoadSession:           true,
+			SessionList:           true,
+			SessionResume:         true,
+			SessionClose:          true,
+			SessionDelete:         true,
+			AdditionalDirectories: true,
 		},
 	})
 
@@ -47,6 +52,35 @@ func TestInitializeResponse(t *testing.T) {
 	promptCaps := caps["promptCapabilities"].(map[string]any)
 	if promptCaps["image"] != true || promptCaps["embeddedContext"] != true {
 		t.Fatalf("prompt capabilities = %#v", promptCaps)
+	}
+	sessionCaps := caps["sessionCapabilities"].(map[string]any)
+	for _, key := range []string{"list", "resume", "close", "delete", "additionalDirectories"} {
+		if _, ok := sessionCaps[key].(map[string]any); !ok {
+			t.Fatalf("sessionCapabilities[%q] = %#v, want empty object", key, sessionCaps[key])
+		}
+	}
+}
+
+func TestInitializeOmitsUnsupportedSessionCapabilities(t *testing.T) {
+	server := NewServer(AdapterInfo{
+		Name:    "minimal-acp-adapter",
+		Version: "test",
+	})
+
+	var out bytes.Buffer
+	err := server.Serve(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"), &out)
+	if err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v\n%s", err, out.String())
+	}
+	result := got["result"].(map[string]any)
+	caps := result["agentCapabilities"].(map[string]any)
+	if _, ok := caps["sessionCapabilities"]; ok {
+		t.Fatalf("sessionCapabilities = %#v, want omitted", caps["sessionCapabilities"])
 	}
 }
 

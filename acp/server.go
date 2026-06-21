@@ -24,11 +24,16 @@ type AdapterInfo struct {
 }
 
 type Capabilities struct {
-	Images          bool
-	EmbeddedContext bool
-	MCPHTTP         bool
-	MCPSSE          bool
-	LoadSession     bool
+	Images                bool
+	EmbeddedContext       bool
+	MCPHTTP               bool
+	MCPSSE                bool
+	LoadSession           bool
+	SessionList           bool
+	SessionResume         bool
+	SessionClose          bool
+	SessionDelete         bool
+	AdditionalDirectories bool
 }
 
 type AuthMethod struct {
@@ -321,7 +326,8 @@ func (s *Server) handle(ctx *MethodContext, req request) response {
 					HTTP: s.info.Capabilities.MCPHTTP,
 					SSE:  s.info.Capabilities.MCPSSE,
 				},
-				Auth: authCapabilitiesFromServer(s),
+				Auth:                authCapabilitiesFromServer(s),
+				SessionCapabilities: sessionCapabilitiesFromInfo(s.info),
 			},
 			AgentInfo: agentInfo{
 				Name:    s.info.Name,
@@ -429,14 +435,23 @@ type initializeResult struct {
 }
 
 type agentCapabilities struct {
-	LoadSession        bool               `json:"loadSession,omitempty"`
-	PromptCapabilities promptCapabilities `json:"promptCapabilities"`
-	MCPCapabilities    mcpCapabilities    `json:"mcpCapabilities"`
-	Auth               *authCapabilities  `json:"auth,omitempty"`
+	LoadSession         bool                 `json:"loadSession,omitempty"`
+	PromptCapabilities  promptCapabilities   `json:"promptCapabilities"`
+	MCPCapabilities     mcpCapabilities      `json:"mcpCapabilities"`
+	Auth                *authCapabilities    `json:"auth,omitempty"`
+	SessionCapabilities *sessionCapabilities `json:"sessionCapabilities,omitempty"`
 }
 
 type authCapabilities struct {
 	Logout *emptyObject `json:"logout,omitempty"`
+}
+
+type sessionCapabilities struct {
+	List                  *emptyObject `json:"list,omitempty"`
+	Resume                *emptyObject `json:"resume,omitempty"`
+	Close                 *emptyObject `json:"close,omitempty"`
+	Delete                *emptyObject `json:"delete,omitempty"`
+	AdditionalDirectories *emptyObject `json:"additionalDirectories,omitempty"`
 }
 
 type emptyObject struct{}
@@ -462,6 +477,34 @@ func authCapabilitiesFromServer(s *Server) *authCapabilities {
 		return nil
 	}
 	return &authCapabilities{Logout: &emptyObject{}}
+}
+
+func sessionCapabilitiesFromInfo(info AdapterInfo) *sessionCapabilities {
+	caps := info.Capabilities
+	out := &sessionCapabilities{}
+	if caps.SessionList {
+		out.List = &emptyObject{}
+	}
+	if caps.SessionResume {
+		out.Resume = &emptyObject{}
+	}
+	if caps.SessionClose {
+		out.Close = &emptyObject{}
+	}
+	if caps.SessionDelete {
+		out.Delete = &emptyObject{}
+	}
+	if caps.AdditionalDirectories {
+		out.AdditionalDirectories = &emptyObject{}
+	}
+	if out.List == nil &&
+		out.Resume == nil &&
+		out.Close == nil &&
+		out.Delete == nil &&
+		out.AdditionalDirectories == nil {
+		return nil
+	}
+	return out
 }
 
 type connection struct {
