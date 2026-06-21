@@ -44,6 +44,7 @@ Adapters have two runtime integration paths:
   session ids may opt into adopting unknown `session/load` or `session/resume`
   ids so the provider command can continue a session known to the host after an
   adapter process restart. Command-backed adapters can also advertise ACP
+  `session/delete` as destructive in-memory session cleanup, advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
 
