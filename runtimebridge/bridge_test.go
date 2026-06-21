@@ -701,6 +701,38 @@ func TestCloseSessionProxiesToRuntime(t *testing.T) {
 	}
 }
 
+func TestCloseSessionRequestCancelsActiveRuntimePrompt(t *testing.T) {
+	runtime := newFakeRuntimeClient()
+	runtime.blockPromptUntilCancel = true
+	runtime.closeCancelsPrompt = true
+	client := newBridgeClient(t, runtime)
+
+	envelopes := client.SendRaw(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":"prompt-1","method":"session/prompt","params":{"sessionId":"sess-bridge","prompt":[{"type":"text","text":"keep going"}]}}`,
+		`{"jsonrpc":"2.0","id":"close-1","method":"session/close","params":{"sessionId":"sess-bridge"}}`,
+	}, "\n") + "\n")
+	if len(envelopes) != 2 {
+		t.Fatalf("got %d envelopes, want close response + cancelled prompt response", len(envelopes))
+	}
+	byID := map[string]acptest.Response{}
+	for _, envelope := range envelopes {
+		byID[string(envelope.ID)] = envelope
+	}
+	var closeResult map[string]any
+	byID[`"close-1"`].ResultInto(t, &closeResult)
+
+	var promptResult struct {
+		StopReason string `json:"stopReason"`
+	}
+	byID[`"prompt-1"`].ResultInto(t, &promptResult)
+	if promptResult.StopReason != "cancelled" {
+		t.Fatalf("stopReason = %q, want cancelled", promptResult.StopReason)
+	}
+	if runtime.called("session/close") != 1 {
+		t.Fatalf("session/close calls = %d, want 1", runtime.called("session/close"))
+	}
+}
+
 func TestCloseSessionForwardsRuntimeUpdatesBeforeResponse(t *testing.T) {
 	runtime := newFakeRuntimeClient()
 	runtime.events = make(chan runtimejsonrpc.Event)
@@ -1000,6 +1032,7 @@ type fakeRuntimeClient struct {
 	childRequestReturnsOnCancel   bool
 	blockPromptUntilCancel        bool
 	blockPromptUntilContextCancel bool
+	closeCancelsPrompt            bool
 	promptResult                  json.RawMessage
 	listSessionsResult            json.RawMessage
 	cancelled                     chan struct{}
@@ -1127,6 +1160,15 @@ func (f *fakeRuntimeClient) Request(ctx context.Context, method string, params a
 		}
 		return json.RawMessage(`{"sessions":[{"sessionId":"sess-bridge","cwd":"/tmp/project","title":"Bridge session"}],"nextCursor":"next"}`), nil
 	case "session/close":
+		if f.closeCancelsPrompt {
+			f.mu.Lock()
+			select {
+			case <-f.cancelled:
+			default:
+				close(f.cancelled)
+			}
+			f.mu.Unlock()
+		}
 		for _, params := range f.closeUpdates {
 			f.events <- runtimejsonrpc.Event{
 				Method: "session/update",

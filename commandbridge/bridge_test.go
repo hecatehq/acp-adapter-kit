@@ -1042,6 +1042,102 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	}
 }
 
+func TestBridgeCloseSessionRemovesSessionState(t *testing.T) {
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	closeResp := client.Request("session/close", map[string]any{"sessionId": "session-1"})
+	var closeResult map[string]any
+	closeResp.ResultInto(t, &closeResult)
+
+	listResp := client.Request("session/list", map[string]any{})
+	var list struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+		} `json:"sessions"`
+	}
+	listResp.ResultInto(t, &list)
+	if len(list.Sessions) != 0 {
+		t.Fatalf("sessions after close = %#v, want closed session removed", list.Sessions)
+	}
+
+	promptResp := client.Request("session/prompt", map[string]any{
+		"sessionId": "session-1",
+		"prompt":    []map[string]any{{"type": "text", "text": "after close"}},
+	})
+	if promptResp.Error == nil || promptResp.Error.Code != -32001 || promptResp.Error.Message != "session not found" {
+		t.Fatalf("prompt after close error = %#v, want session not found", promptResp.Error)
+	}
+}
+
+func TestBridgeCloseRequestCancelsActivePromptAndRemovesSession(t *testing.T) {
+	started := make(chan struct{})
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(ctx context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				return adapterprocess.Result{}, ctx.Err()
+			case <-time.After(2 * time.Second):
+				return adapterprocess.Result{}, errors.New("prompt was not cancelled")
+			}
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	promptDone := make(chan []acptest.Response, 1)
+	go func() {
+		promptDone <- client.Send(promptRequest(2, "session-1", "close soon"))
+	}()
+	<-started
+	closeResp := client.Request("session/close", map[string]any{"sessionId": "session-1"})
+	var closeResult map[string]any
+	closeResp.ResultInto(t, &closeResult)
+
+	responses := <-promptDone
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + tool finish + prompt response", len(responses))
+	}
+	finish := decodeCommandToolUpdate(t, responses[1])
+	if finish.Update.SessionUpdate != "tool_call_update" ||
+		finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") {
+		t.Fatalf("tool finish = %#v, want failed cancelled command", finish)
+	}
+	var result struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[2].ResultInto(t, &result)
+	if result.StopReason != "cancelled" {
+		t.Fatalf("stop reason = %q, want cancelled", result.StopReason)
+	}
+
+	listResp := client.Request("session/list", map[string]any{})
+	var list struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+		} `json:"sessions"`
+	}
+	listResp.ResultInto(t, &list)
+	if len(list.Sessions) != 0 {
+		t.Fatalf("sessions after close = %#v, want closed session removed", list.Sessions)
+	}
+}
+
 func TestBridgePassesPromptLifecycleStateToCommandBuilder(t *testing.T) {
 	ids := []string{"session-1", "session-2"}
 	var nextID int

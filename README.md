@@ -34,7 +34,8 @@ Adapters have two runtime integration paths:
   the command, forwarding stdout as assistant text, cancelling the process when
   ACP `session/cancel` arrives, supporting in-memory `session/load`,
   `session/resume`, and `session/fork`, returning command-backed session list
-  metadata, publishing `config_option_update` notifications after config
+  metadata, treating ACP `session/close` as active-work cancellation plus
+  in-memory session cleanup, publishing `config_option_update` notifications after config
   changes, publishing `session_info_update` notifications when transcript
   metadata changes, translating structured command streams into ACP updates
   when a parser is configured, requesting ACP tool permissions from parsed
