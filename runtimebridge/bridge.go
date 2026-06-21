@@ -40,7 +40,7 @@ func (b *Bridge) Options() []acp.Option {
 		acp.WithMethod("session/prompt", b.prompt),
 		acp.WithMethod("mcp/message", b.mcpMessage),
 		acp.WithConcurrentMethod("session/cancel", b.cancelMethod),
-		acp.WithMethod("session/close", b.closeSession),
+		acp.WithConcurrentMethod("session/close", b.closeSession),
 		acp.WithMethod("session/delete", b.deleteSession),
 		acp.WithNotification("session/cancel", b.cancelNotification),
 		acp.WithNotification("mcp/message", b.mcpMessageNotification),

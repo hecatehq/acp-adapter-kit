@@ -159,7 +159,7 @@ func (b *Bridge) Options() []acp.Option {
 		acp.WithMethod("session/set_mode", b.setMode),
 		acp.WithMethod("session/prompt", b.prompt),
 		acp.WithConcurrentMethod("session/cancel", b.cancelMethod),
-		acp.WithMethod("session/close", b.closeSession),
+		acp.WithConcurrentMethod("session/close", b.closeSession),
 		acp.WithMethod("session/delete", b.deleteSession),
 		acp.WithNotification("session/cancel", b.cancelNotification),
 	}
@@ -916,6 +916,9 @@ func (b *Bridge) closeSession(_ *acp.MethodContext, params json.RawMessage) (any
 		return nil, rpcErr
 	}
 	b.cancel(req.SessionID)
+	b.mu.Lock()
+	delete(b.sessions, req.SessionID)
+	b.mu.Unlock()
 	return map[string]any{}, nil
 }
 
