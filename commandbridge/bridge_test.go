@@ -1539,6 +1539,60 @@ func TestBridgeCancelStopsStreamingPromptWithoutRecordingTranscript(t *testing.T
 	}
 }
 
+func TestBridgeDropsStreamChunksAfterCancel(t *testing.T) {
+	started := make(chan struct{})
+	lateErr := make(chan error, 1)
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: streamingRunnerFunc(func(ctx context.Context, _ adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			if err := onStdout([]byte("before cancel")); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			close(started)
+			<-ctx.Done()
+			lateErr <- onStdout([]byte("late after cancel"))
+			return adapterprocess.Result{Stdout: []byte("before cancel\nlate after cancel")}, ctx.Err()
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	promptDone := make(chan []acptest.Response, 1)
+	go func() {
+		promptDone <- client.Send(promptRequest(2, "session-1", "stop soon"))
+	}()
+	<-started
+	client.Notify("session/cancel", map[string]any{"sessionId": "session-1"})
+
+	responses := <-promptDone
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want tool start + one chunk + tool finish + prompt response: %#v", len(responses), responses)
+	}
+	chunk := decodeAgentChunk(t, responses[1])
+	if chunk.Update.Content.Text != "before cancel" {
+		t.Fatalf("chunk = %#v, want only pre-cancel output", chunk)
+	}
+	if err := <-lateErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("late onStdout error = %v, want context canceled", err)
+	}
+	finish := decodeCommandToolUpdate(t, responses[2])
+	if finish.Update.Status != "failed" ||
+		!strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") ||
+		strings.Contains(finish.Update.Content[0].Content.Text, "late after cancel") {
+		t.Fatalf("tool finish = %#v, want cancelled command without late output", finish)
+	}
+	var cancelled struct {
+		StopReason string `json:"stopReason"`
+	}
+	responses[3].ResultInto(t, &cancelled)
+	if cancelled.StopReason != "cancelled" {
+		t.Fatalf("stop reason = %q, want cancelled", cancelled.StopReason)
+	}
+}
+
 func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },

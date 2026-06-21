@@ -466,6 +466,9 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 	if runner, ok := b.spec.Runner.(StreamRunner); ok {
 		var assistantText strings.Builder
 		result, err := runner.RunStream(runCtx, command, func(chunk []byte) error {
+			if contextErr := runCtx.Err(); contextErr != nil {
+				return contextErr
+			}
 			if parser == nil {
 				assistantText.Write(chunk)
 				return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
@@ -491,6 +494,7 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			finishResult.Stdout = nil
 			finishResult.StdoutTruncated = false
 		}
+		finishResult = promptCommandResultForFinish(finishResult, runCtx.Err())
 		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, finishResult, err, runCtx.Err()); notifyErr != nil && err == nil {
 			err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 		}
@@ -503,10 +507,22 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			err = fmt.Errorf("notification failed: %w", notifyErr)
 		}
 	}
-	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, err, runCtx.Err()); notifyErr != nil && err == nil {
+	finishResult := promptCommandResultForFinish(result, runCtx.Err())
+	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, finishResult, err, runCtx.Err()); notifyErr != nil && err == nil {
 		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 	}
 	return result, string(result.Stdout), err
+}
+
+func promptCommandResultForFinish(result adapterprocess.Result, contextErr error) adapterprocess.Result {
+	if contextErr == nil {
+		return result
+	}
+	result.Stdout = nil
+	result.Stderr = nil
+	result.StdoutTruncated = false
+	result.StderrTruncated = false
+	return result
 }
 
 func (b *Bridge) newStreamParser(session Session, params runtimeacp.PromptParams) StreamParser {
