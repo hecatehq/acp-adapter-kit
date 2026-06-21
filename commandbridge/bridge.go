@@ -689,9 +689,12 @@ func requestStreamPermission(ctx *acp.MethodContext, sessionID string, req Permi
 	}
 	switch outcome.Outcome {
 	case "selected":
+		if strings.TrimSpace(outcome.OptionID) == "" {
+			return fmt.Errorf("permission response missing selected option for %s", permissionRequestTitle(req))
+		}
 		option, ok := findPermissionOption(req.Options, outcome.OptionID)
 		if !ok {
-			option = PermissionOption{OptionID: outcome.OptionID, Kind: outcome.OptionID, Name: outcome.OptionID}
+			return fmt.Errorf("permission response selected unknown option %q for %s", outcome.OptionID, permissionRequestTitle(req))
 		}
 		if permissionOptionAllows(option) {
 			return nil
