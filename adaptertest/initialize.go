@@ -12,16 +12,21 @@ import (
 )
 
 type InitializeContract struct {
-	Name            string
-	Title           string
-	Version         string
-	Images          bool
-	EmbeddedContext bool
-	MCPHTTP         bool
-	MCPSSE          bool
-	LoadSession     bool
-	Logout          bool
-	AuthMethodIDs   []string
+	Name                  string
+	Title                 string
+	Version               string
+	Images                bool
+	EmbeddedContext       bool
+	MCPHTTP               bool
+	MCPSSE                bool
+	LoadSession           bool
+	SessionList           bool
+	SessionResume         bool
+	SessionClose          bool
+	SessionDelete         bool
+	AdditionalDirectories bool
+	Logout                bool
+	AuthMethodIDs         []string
 }
 
 // AssertInitializeContract verifies the initialize surface Hecate relies on
@@ -45,6 +50,13 @@ func AssertInitializeContract(t testing.TB, server *acp.Server, want InitializeC
 				HTTP bool `json:"http"`
 				SSE  bool `json:"sse"`
 			} `json:"mcpCapabilities"`
+			SessionCapabilities *struct {
+				List                  map[string]any `json:"list"`
+				Resume                map[string]any `json:"resume"`
+				Close                 map[string]any `json:"close"`
+				Delete                map[string]any `json:"delete"`
+				AdditionalDirectories map[string]any `json:"additionalDirectories"`
+			} `json:"sessionCapabilities"`
 			Auth *struct {
 				Logout map[string]any `json:"logout"`
 			} `json:"auth"`
@@ -82,6 +94,21 @@ func AssertInitializeContract(t testing.TB, server *acp.Server, want InitializeC
 	}
 	if caps.MCPCapabilities.SSE != want.MCPSSE {
 		t.Fatalf("mcpCapabilities.sse = %v, want %v", caps.MCPCapabilities.SSE, want.MCPSSE)
+	}
+	if got := caps.SessionCapabilities != nil && caps.SessionCapabilities.List != nil; got != want.SessionList {
+		t.Fatalf("sessionCapabilities.list advertised = %v, want %v", got, want.SessionList)
+	}
+	if got := caps.SessionCapabilities != nil && caps.SessionCapabilities.Resume != nil; got != want.SessionResume {
+		t.Fatalf("sessionCapabilities.resume advertised = %v, want %v", got, want.SessionResume)
+	}
+	if got := caps.SessionCapabilities != nil && caps.SessionCapabilities.Close != nil; got != want.SessionClose {
+		t.Fatalf("sessionCapabilities.close advertised = %v, want %v", got, want.SessionClose)
+	}
+	if got := caps.SessionCapabilities != nil && caps.SessionCapabilities.Delete != nil; got != want.SessionDelete {
+		t.Fatalf("sessionCapabilities.delete advertised = %v, want %v", got, want.SessionDelete)
+	}
+	if got := caps.SessionCapabilities != nil && caps.SessionCapabilities.AdditionalDirectories != nil; got != want.AdditionalDirectories {
+		t.Fatalf("sessionCapabilities.additionalDirectories advertised = %v, want %v", got, want.AdditionalDirectories)
 	}
 	gotLogout := caps.Auth != nil && caps.Auth.Logout != nil
 	if gotLogout != want.Logout {
