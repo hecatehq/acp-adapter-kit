@@ -82,6 +82,18 @@ func WithAutoAllowPermissions() LiveClientOption {
 	})
 }
 
+func WithAutoRejectPermissions() LiveClientOption {
+	return WithLiveResponseHandler(func(client *LiveClient, response Response) {
+		client.AutoRejectPermission(response)
+	})
+}
+
+func WithAutoCancelPermissions() LiveClientOption {
+	return WithLiveResponseHandler(func(client *LiveClient, response Response) {
+		client.AutoCancelPermission(response)
+	})
+}
+
 func (c *LiveClient) Request(id string, method string, params any, timeout time.Duration) []Response {
 	c.t.Helper()
 	c.Write(map[string]any{
@@ -223,19 +235,56 @@ func (c *LiveClient) AutoAllowPermission(response Response) {
 	if optionID == "" {
 		c.t.Fatalf("permission request has no allow option: %#v", req.Options)
 	}
+	c.WritePermissionOutcome(response.ID, "selected", optionID)
+}
+
+func (c *LiveClient) AutoRejectPermission(response Response) {
+	c.t.Helper()
+	if response.Method != "session/request_permission" || len(response.ID) == 0 {
+		return
+	}
+	var req struct {
+		Options []struct {
+			OptionID string `json:"optionId"`
+			Name     string `json:"name"`
+			Kind     string `json:"kind"`
+		} `json:"options"`
+	}
+	response.ParamsInto(c.t, &req)
+	optionID := firstRejectOption(req.Options)
+	if optionID == "" {
+		c.t.Fatalf("permission request has no reject option: %#v", req.Options)
+	}
+	c.WritePermissionOutcome(response.ID, "selected", optionID)
+}
+
+func (c *LiveClient) AutoCancelPermission(response Response) {
+	c.t.Helper()
+	if response.Method != "session/request_permission" || len(response.ID) == 0 {
+		return
+	}
+	c.WritePermissionOutcome(response.ID, "cancelled", "")
+}
+
+func (c *LiveClient) WritePermissionOutcome(id json.RawMessage, outcome, optionID string) {
+	c.t.Helper()
+	outcomePayload := map[string]any{
+		"outcome": outcome,
+	}
+	result := map[string]any{
+		"outcome": outcomePayload,
+	}
+	if optionID != "" {
+		outcomePayload["optionId"] = optionID
+	}
 	c.Write(struct {
 		JSONRPC string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
 		Result  any             `json:"result"`
 	}{
 		JSONRPC: "2.0",
-		ID:      append(json.RawMessage(nil), response.ID...),
-		Result: map[string]any{
-			"outcome": map[string]any{
-				"outcome":  "selected",
-				"optionId": optionID,
-			},
-		},
+		ID:      append(json.RawMessage(nil), id...),
+		Result:  result,
 	})
 }
 
@@ -281,6 +330,26 @@ func firstAllowOption(options []struct {
 }) string {
 	for _, option := range options {
 		if strings.Contains(strings.ToLower(option.Kind), "allow") || strings.Contains(strings.ToLower(option.OptionID), "allow") {
+			return option.OptionID
+		}
+	}
+	return ""
+}
+
+func firstRejectOption(options []struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+}) string {
+	for _, option := range options {
+		kind := strings.ToLower(option.Kind)
+		id := strings.ToLower(option.OptionID)
+		if strings.Contains(kind, "reject") ||
+			strings.Contains(kind, "deny") ||
+			strings.Contains(kind, "block") ||
+			strings.Contains(id, "reject") ||
+			strings.Contains(id, "deny") ||
+			strings.Contains(id, "block") {
 			return option.OptionID
 		}
 	}

@@ -68,6 +68,78 @@ func TestLiveClientAutoAllowsPermissionRequests(t *testing.T) {
 	}
 }
 
+func TestLiveClientAutoRejectsPermissionRequests(t *testing.T) {
+	server := acp.NewServer(acp.AdapterInfo{Name: "test"},
+		acp.WithMethod("test/permission", func(ctx *acp.MethodContext, _ json.RawMessage) (any, *acp.RPCError) {
+			result, rpcErr, err := ctx.Request("session/request_permission", map[string]any{
+				"options": []map[string]string{
+					{"optionId": "allow_once", "kind": "allow"},
+					{"optionId": "reject_once", "kind": "reject_once"},
+				},
+			})
+			if err != nil {
+				return nil, &acp.RPCError{Code: -32000, Message: err.Error()}
+			}
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			return json.RawMessage(result), nil
+		}),
+	)
+	client := acptest.NewLiveClient(t, server, acptest.WithAutoRejectPermissions())
+
+	responses := client.Request("req-reject", "test/permission", nil, time.Second)
+	if len(responses) != 2 {
+		t.Fatalf("responses = %#v, want permission request + final response", responses)
+	}
+	var final struct {
+		Outcome struct {
+			Outcome  string `json:"outcome"`
+			OptionID string `json:"optionId"`
+		} `json:"outcome"`
+	}
+	responses[1].ResultInto(t, &final)
+	if final.Outcome.Outcome != "selected" || final.Outcome.OptionID != "reject_once" {
+		t.Fatalf("permission result = %#v, want selected reject_once", final.Outcome)
+	}
+}
+
+func TestLiveClientAutoCancelsPermissionRequests(t *testing.T) {
+	server := acp.NewServer(acp.AdapterInfo{Name: "test"},
+		acp.WithMethod("test/permission", func(ctx *acp.MethodContext, _ json.RawMessage) (any, *acp.RPCError) {
+			result, rpcErr, err := ctx.Request("session/request_permission", map[string]any{
+				"options": []map[string]string{
+					{"optionId": "allow_once", "kind": "allow"},
+					{"optionId": "reject_once", "kind": "reject_once"},
+				},
+			})
+			if err != nil {
+				return nil, &acp.RPCError{Code: -32000, Message: err.Error()}
+			}
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			return json.RawMessage(result), nil
+		}),
+	)
+	client := acptest.NewLiveClient(t, server, acptest.WithAutoCancelPermissions())
+
+	responses := client.Request("req-cancel", "test/permission", nil, time.Second)
+	if len(responses) != 2 {
+		t.Fatalf("responses = %#v, want permission request + final response", responses)
+	}
+	var final struct {
+		Outcome struct {
+			Outcome  string `json:"outcome"`
+			OptionID string `json:"optionId"`
+		} `json:"outcome"`
+	}
+	responses[1].ResultInto(t, &final)
+	if final.Outcome.Outcome != "cancelled" || final.Outcome.OptionID != "" {
+		t.Fatalf("permission result = %#v, want cancelled without option", final.Outcome)
+	}
+}
+
 func TestLiveClientPromptTextAndCancel(t *testing.T) {
 	cancelled := make(chan struct{})
 	server := acp.NewServer(acp.AdapterInfo{Name: "test"},
