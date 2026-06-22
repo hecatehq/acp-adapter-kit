@@ -15,6 +15,7 @@ This module intentionally contains provider-neutral pieces only:
 - provider-neutral doctor command runner support;
 - fake runtime and protocol test utilities;
 - reusable live ACP test client utilities for opt-in integration smoke tests;
+- reusable stdio MCP echo-server fixture for adapter smoke tests;
 - reusable adapter conformance assertions for provider-neutral initialize,
   capability, auth, session selector, and available-command checks.
 
