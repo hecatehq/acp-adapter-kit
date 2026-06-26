@@ -9,7 +9,8 @@ This module intentionally contains provider-neutral pieces only:
 - command-backed ACP session scaffolding for adapters that invoke a local CLI
   per prompt;
 - runtime JSON-RPC client and cancellation plumbing;
-- ACP runtime request/result helpers;
+- ACP runtime request/result helpers for sessions, config, MCP, auth, and
+  terminal callbacks;
 - runtime bridge and host scaffolding;
 - process launching and bounded output capture;
 - provider-neutral doctor command runner support;
