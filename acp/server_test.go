@@ -299,6 +299,57 @@ func TestMethodContextRequestWaitsForClientResponse(t *testing.T) {
 	}
 }
 
+func TestMethodContextRequestsUseDistinctOutboundIDs(t *testing.T) {
+	server := NewServer(AdapterInfo{Name: "codex-acp-adapter"}, WithMethod("test/needs_client_twice", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+		first, rpcErr, err := ctx.Request("client/first", nil)
+		if err != nil {
+			return nil, &RPCError{Code: -32000, Message: "first request failed", Data: err.Error()}
+		}
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		second, rpcErr, err := ctx.Request("client/second", nil)
+		if err != nil {
+			return nil, &RPCError{Code: -32000, Message: "second request failed", Data: err.Error()}
+		}
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		return map[string]any{"first": string(first), "second": string(second)}, nil
+	}))
+
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"test/needs_client_twice","params":{}}`,
+		`{"jsonrpc":"2.0","id":"server-1","result":{"ok":"first"}}`,
+		`{"jsonrpc":"2.0","id":"server-2","result":{"ok":"second"}}`,
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(strings.NewReader(input), &out); err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+
+	envelopes := decodeServerEnvelopes(t, out.Bytes())
+	if len(envelopes) != 3 {
+		t.Fatalf("got %d envelopes, want two client requests + final response\n%s", len(envelopes), out.String())
+	}
+	if envelopes[0].Method != "client/first" || string(envelopes[0].ID) != `"server-1"` {
+		t.Fatalf("first client request = method %q id %s, want client/first server-1", envelopes[0].Method, envelopes[0].ID)
+	}
+	if envelopes[1].Method != "client/second" || string(envelopes[1].ID) != `"server-2"` {
+		t.Fatalf("second client request = method %q id %s, want client/second server-2", envelopes[1].Method, envelopes[1].ID)
+	}
+	if string(envelopes[0].ID) == string(envelopes[1].ID) {
+		t.Fatalf("client request IDs are not distinct: %s", envelopes[0].ID)
+	}
+	var result map[string]string
+	if err := json.Unmarshal(envelopes[2].Result, &result); err != nil {
+		t.Fatalf("decode final result: %v", err)
+	}
+	if !strings.Contains(result["first"], "first") || !strings.Contains(result["second"], "second") {
+		t.Fatalf("final result = %#v, want both client responses", result)
+	}
+}
+
 func TestMethodContextRequestReturnsClientRPCError(t *testing.T) {
 	server := NewServer(AdapterInfo{Name: "codex-acp-adapter"}, WithMethod("test/needs_client", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
 		_, rpcErr, err := ctx.Request("client/approve", nil)
