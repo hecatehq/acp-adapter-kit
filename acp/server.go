@@ -87,8 +87,23 @@ func (c *MethodContext) Notify(method string, params any) error {
 }
 
 func (c *MethodContext) Request(method string, params any) (json.RawMessage, *RPCError, error) {
+	return c.RequestContext(c.Context(), method, params)
+}
+
+// RequestContext sends a request to the connected ACP client and waits for its
+// response or for ctx to be cancelled. A cancelled request is abandoned and a
+// best-effort $/cancel_request notification is sent to the client. A response
+// that arrives later is discarded instead of being retained for a future
+// outbound request.
+func (c *MethodContext) RequestContext(ctx context.Context, method string, params any) (json.RawMessage, *RPCError, error) {
 	if c == nil || c.conn == nil {
 		return nil, nil, errors.New("method context is not connected")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	id, resultCh, err := c.conn.registerRequest()
 	if err != nil {
@@ -109,9 +124,14 @@ func (c *MethodContext) Request(method string, params any) (json.RawMessage, *RP
 			return nil, nil, result.err
 		}
 		return append(json.RawMessage(nil), result.result...), result.rpcErr, nil
-	case <-c.Context().Done():
-		c.conn.removeRequest(id)
-		return nil, nil, c.Context().Err()
+	case <-ctx.Done():
+		c.conn.abandonRequest(id)
+		_ = c.conn.write(serverNotification{
+			JSONRPC: "2.0",
+			Method:  "$/cancel_request",
+			Params:  cancelRequestParams{RequestID: id},
+		})
+		return nil, nil, ctx.Err()
 	}
 }
 
@@ -185,7 +205,7 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 		scanner:   scanner,
 		encoder:   json.NewEncoder(output),
 		pending:   map[string]chan clientResponse{},
-		responses: map[string]clientResponse{},
+		queued:    map[string]struct{}{},
 		active:    map[string]context.CancelFunc{},
 		cancelled: map[string]struct{}{},
 	}
@@ -267,6 +287,7 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 			Method:  msg.Method,
 			Params:  msg.Params,
 		}
+		conn.queueInboundRequest(req.ID)
 		if s.concurrent[msg.Method] {
 			runConcurrent(req)
 			continue
@@ -517,7 +538,7 @@ type connection struct {
 	requestMu sync.Mutex
 	nextID    int64
 	pending   map[string]chan clientResponse
-	responses map[string]clientResponse
+	queued    map[string]struct{}
 	active    map[string]context.CancelFunc
 	cancelled map[string]struct{}
 	closed    bool
@@ -614,11 +635,6 @@ func (c *connection) registerRequest() (json.RawMessage, <-chan clientResponse, 
 	}
 	key := string(raw)
 	resultCh := make(chan clientResponse, 1)
-	if response, ok := c.responses[key]; ok {
-		delete(c.responses, key)
-		resultCh <- response
-		return raw, resultCh, nil
-	}
 	if c.closed {
 		if c.closeErr != nil {
 			return nil, nil, c.closeErr
@@ -635,6 +651,12 @@ func (c *connection) removeRequest(id json.RawMessage) {
 	delete(c.pending, string(id))
 }
 
+func (c *connection) abandonRequest(id json.RawMessage) {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+	delete(c.pending, string(id))
+}
+
 func (c *connection) beginInboundRequest(id *json.RawMessage) (*MethodContext, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	if id == nil {
@@ -642,6 +664,7 @@ func (c *connection) beginInboundRequest(id *json.RawMessage) (*MethodContext, f
 	}
 	key := string(*id)
 	c.requestMu.Lock()
+	delete(c.queued, key)
 	if _, ok := c.cancelled[key]; ok {
 		delete(c.cancelled, key)
 		cancel()
@@ -658,15 +681,27 @@ func (c *connection) beginInboundRequest(id *json.RawMessage) (*MethodContext, f
 	}
 }
 
+func (c *connection) queueInboundRequest(id *json.RawMessage) {
+	if id == nil {
+		return
+	}
+	c.requestMu.Lock()
+	c.queued[string(*id)] = struct{}{}
+	c.requestMu.Unlock()
+}
+
 func (c *connection) cancelInboundRequest(params json.RawMessage) {
 	var req cancelRequestParams
 	if err := json.Unmarshal(params, &req); err != nil || len(req.RequestID) == 0 {
 		return
 	}
+	key := string(req.RequestID)
 	c.requestMu.Lock()
-	cancel := c.active[string(req.RequestID)]
+	cancel := c.active[key]
 	if cancel == nil {
-		c.cancelled[string(req.RequestID)] = struct{}{}
+		if _, ok := c.queued[key]; ok {
+			c.cancelled[key] = struct{}{}
+		}
 	}
 	c.requestMu.Unlock()
 	if cancel != nil {
@@ -687,9 +722,6 @@ func (c *connection) deliverResponse(msg message) {
 	resultCh := c.pending[key]
 	if resultCh != nil {
 		delete(c.pending, key)
-	}
-	if resultCh == nil {
-		c.responses[key] = response
 	}
 	c.requestMu.Unlock()
 	if resultCh != nil {

@@ -126,10 +126,128 @@ type PreparedFile struct {
 }
 
 type EmbeddedResource struct {
-	URI      string `json:"uri"`
-	Text     string `json:"text,omitempty"`
-	Blob     string `json:"blob,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
+	URI      string               `json:"uri"`
+	Text     string               `json:"text,omitempty"`
+	Blob     string               `json:"blob,omitempty"`
+	MimeType string               `json:"mimeType,omitempty"`
+	Kind     EmbeddedResourceKind `json:"-"`
+}
+
+// EmbeddedResourceKind preserves which required ACP embedded-resource union
+// key was present, including when the text or blob value is empty.
+type EmbeddedResourceKind string
+
+const (
+	EmbeddedResourceText EmbeddedResourceKind = "text"
+	EmbeddedResourceBlob EmbeddedResourceKind = "blob"
+)
+
+// ContentKind resolves the embedded-resource union variant. Kind is required
+// only when the selected text/blob value is empty; non-empty legacy literals
+// continue to infer the variant.
+func (r EmbeddedResource) ContentKind() (EmbeddedResourceKind, error) {
+	if r.Text != "" && r.Blob != "" {
+		return "", errors.New("embedded resource cannot contain text and blob")
+	}
+	switch r.Kind {
+	case EmbeddedResourceText:
+		if r.Blob != "" {
+			return "", errors.New("text embedded resource cannot contain blob data")
+		}
+		return EmbeddedResourceText, nil
+	case EmbeddedResourceBlob:
+		if r.Text != "" {
+			return "", errors.New("blob embedded resource cannot contain text data")
+		}
+		return EmbeddedResourceBlob, nil
+	case "":
+		switch {
+		case r.Text != "":
+			return EmbeddedResourceText, nil
+		case r.Blob != "":
+			return EmbeddedResourceBlob, nil
+		default:
+			return "", errors.New("embedded resource must select text or blob content")
+		}
+	default:
+		return "", fmt.Errorf("unknown embedded resource kind %q", r.Kind)
+	}
+}
+
+func (r *EmbeddedResource) UnmarshalJSON(data []byte) error {
+	if r == nil {
+		return errors.New("cannot unmarshal embedded resource into nil receiver")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, hasURI := fields["uri"]
+	_, hasText := fields["text"]
+	_, hasBlob := fields["blob"]
+	if !hasURI {
+		return errors.New("embedded resource URI is required")
+	}
+	var uri *string
+	if err := json.Unmarshal(fields["uri"], &uri); err != nil || uri == nil {
+		return errors.New("embedded resource URI must be a string")
+	}
+	if hasText == hasBlob {
+		return errors.New("embedded resource must contain exactly one of text or blob")
+	}
+	selectedKey := "text"
+	if hasBlob {
+		selectedKey = "blob"
+	}
+	var selectedValue *string
+	if err := json.Unmarshal(fields[selectedKey], &selectedValue); err != nil || selectedValue == nil {
+		return fmt.Errorf("embedded resource %s must be a string", selectedKey)
+	}
+	type wireResource struct {
+		URI      string `json:"uri"`
+		Text     string `json:"text"`
+		Blob     string `json:"blob"`
+		MimeType string `json:"mimeType,omitempty"`
+	}
+	var wire wireResource
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = EmbeddedResource{
+		URI:      *uri,
+		Text:     wire.Text,
+		Blob:     wire.Blob,
+		MimeType: wire.MimeType,
+	}
+	if hasText {
+		r.Text = *selectedValue
+		r.Kind = EmbeddedResourceText
+	} else {
+		r.Blob = *selectedValue
+		r.Kind = EmbeddedResourceBlob
+	}
+	return nil
+}
+
+func (r EmbeddedResource) MarshalJSON() ([]byte, error) {
+	kind, err := r.ContentKind()
+	if err != nil {
+		return nil, err
+	}
+	type wireResource struct {
+		URI      string  `json:"uri"`
+		Text     *string `json:"text,omitempty"`
+		Blob     *string `json:"blob,omitempty"`
+		MimeType string  `json:"mimeType,omitempty"`
+	}
+	wire := wireResource{URI: r.URI, MimeType: r.MimeType}
+	switch kind {
+	case EmbeddedResourceText:
+		wire.Text = &r.Text
+	case EmbeddedResourceBlob:
+		wire.Blob = &r.Blob
+	}
+	return json.Marshal(wire)
 }
 
 type PromptResult struct {

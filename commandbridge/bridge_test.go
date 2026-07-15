@@ -480,13 +480,9 @@ func TestBridgeRequestsPermissionForStructuredStreamTool(t *testing.T) {
 			return adapterprocess.Result{Stdout: []byte(stream)}, nil
 		}),
 	})
-	client := acptest.NewClient(t, server(bridge))
-	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
-
-	responses := client.SendRaw(strings.Join([]string{
-		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
-		`{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}`,
-	}, "\n") + "\n")
+	client := acptest.NewLiveClient(t, server(bridge), acptest.WithAutoAllowPermissions())
+	client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+	responses := client.PromptText("prompt", "session-1", "first", time.Second)
 	if len(responses) != 5 {
 		t.Fatalf("got %d responses, want command start + permission request + message + command finish + prompt response: %#v", len(responses), responses)
 	}
@@ -559,13 +555,9 @@ func TestBridgeRejectsPermissionForStructuredStreamTool(t *testing.T) {
 			return adapterprocess.Result{Stdout: []byte(stream)}, nil
 		}),
 	})
-	client := acptest.NewClient(t, server(bridge))
-	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
-
-	responses := client.SendRaw(strings.Join([]string{
-		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
-		`{"jsonrpc":"2.0","id":"server-1","result":{"outcome":{"outcome":"selected","optionId":"reject"}}}`,
-	}, "\n") + "\n")
+	client := acptest.NewLiveClient(t, server(bridge), acptest.WithAutoRejectPermissions())
+	client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+	responses := client.PromptText("prompt", "session-1", "first", time.Second)
 	if len(responses) != 4 {
 		t.Fatalf("got %d responses, want command start + permission request + command finish + prompt error: %#v", len(responses), responses)
 	}
@@ -681,16 +673,14 @@ func TestBridgePermissionOutcomeVariants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
 			bridge := newPermissionOutcomeTestBridge()
-			client := acptest.NewClient(t, server(bridge))
-			client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
-
-			responses := client.SendRaw(strings.Join([]string{
-				`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"first"}]}}`,
-				tt.clientResponse,
-			}, "\n") + "\n")
+			client := acptest.NewLiveClient(t, server(bridge), acptest.WithLiveResponseHandler(func(client *acptest.LiveClient, response acptest.Response) {
+				if response.Method == "session/request_permission" {
+					client.Write(json.RawMessage(tt.clientResponse))
+				}
+			}))
+			client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+			responses := client.PromptText("prompt", "session-1", "first", time.Second)
 			if tt.wantAllowed {
 				if len(responses) != 5 {
 					t.Fatalf("got %d responses, want command start + permission + message + command finish + prompt response: %#v", len(responses), responses)
@@ -768,12 +758,26 @@ func TestBridgePermissionRequestCancelsWithPrompt(t *testing.T) {
 	if start.Update.Status != "in_progress" {
 		t.Fatalf("start = %#v, want running prompt command", start)
 	}
-	permission := decodePermissionRequest(t, decodeResponse(t, decoder))
+	permissionResponse := decodeResponse(t, decoder)
+	permission := decodePermissionRequest(t, permissionResponse)
 	if permission.ToolCall.ToolCallID != "tool-1" {
 		t.Fatalf("permission = %#v, want tool-1 request", permission)
 	}
 	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"prompt"}}`); err != nil {
 		t.Fatalf("write cancel request: %v", err)
+	}
+	cancelNotification := decodeResponse(t, decoder)
+	if cancelNotification.Method != "$/cancel_request" || len(cancelNotification.ID) != 0 {
+		t.Fatalf("outbound cancellation = %#v, want notification", cancelNotification)
+	}
+	var cancelParams struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(cancelNotification.Params, &cancelParams); err != nil {
+		t.Fatalf("decode outbound cancellation params: %v", err)
+	}
+	if string(cancelParams.RequestID) != string(permissionResponse.ID) {
+		t.Fatalf("outbound cancellation id = %s, want permission id %s", cancelParams.RequestID, permissionResponse.ID)
 	}
 	finish := decodeCommandToolUpdate(t, decodeResponse(t, decoder))
 	if finish.Update.Status != "failed" ||

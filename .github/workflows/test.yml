@@ -22,12 +22,24 @@ jobs:
       - name: Race test
         run: go test -race ./...
 
-  windows-process:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test Windows process containment
-        run: go test ./process
+      - name: Vet
+        run: go vet ./...
+      - name: Test Windows security paths
+        run: go test ./...
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test macOS security paths
+        run: go test ./...
