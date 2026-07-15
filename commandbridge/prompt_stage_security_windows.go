@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 	"unsafe"
@@ -44,6 +45,7 @@ const (
 	windowsPromptResourceShareNoDelete   = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE
 	windowsPromptResourceShareAll        = windowsPromptResourceShareNoDelete | windows.FILE_SHARE_DELETE
 	windowsPromptResourceDeleteChild     = 0x0040
+	windowsPromptResourceFullAccess      = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff
 	windowsPromptResourceDirectoryAccess = windows.FILE_READ_ATTRIBUTES |
 		windows.READ_CONTROL | windows.WRITE_DAC | windows.WRITE_OWNER
 	windowsPromptResourceStageAccess = windowsPromptResourceDirectoryAccess |
@@ -256,7 +258,9 @@ func privateWindowsPromptResourceSecurityDescriptorFor(allowed []*windows.SID) (
 	sddl.WriteString(allowed[0].String())
 	sddl.WriteString("D:P")
 	for _, sid := range allowed {
-		sddl.WriteString("(A;OICI;GA;;;")
+		sddl.WriteString("(A;OICI;0x")
+		sddl.WriteString(strconv.FormatUint(uint64(uint32(windowsPromptResourceFullAccess)), 16))
+		sddl.WriteString(";;;")
 		sddl.WriteString(sid.String())
 		sddl.WriteByte(')')
 	}
