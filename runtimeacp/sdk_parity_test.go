@@ -171,6 +171,60 @@ func TestACPMCPServerMatchesCoderSDKJSONShape(t *testing.T) {
 	)
 }
 
+func TestEmptyEmbeddedResourceVariantsMatchCoderSDKJSONShape(t *testing.T) {
+	const uri = "memory:///empty"
+	tests := []struct {
+		name     string
+		local    runtimeacp.EmbeddedResource
+		upstream sdk.EmbeddedResourceResource
+		kind     runtimeacp.EmbeddedResourceKind
+	}{
+		{
+			name:  "empty text",
+			local: runtimeacp.EmbeddedResource{URI: uri, Kind: runtimeacp.EmbeddedResourceText},
+			upstream: sdk.EmbeddedResourceResource{
+				TextResourceContents: &sdk.TextResourceContents{Uri: uri, Text: ""},
+			},
+			kind: runtimeacp.EmbeddedResourceText,
+		},
+		{
+			name:  "empty blob",
+			local: runtimeacp.EmbeddedResource{URI: uri, Kind: runtimeacp.EmbeddedResourceBlob},
+			upstream: sdk.EmbeddedResourceResource{
+				BlobResourceContents: &sdk.BlobResourceContents{Uri: uri, Blob: ""},
+			},
+			kind: runtimeacp.EmbeddedResourceBlob,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertSameJSONShape(t, test.local, test.upstream)
+			raw := mustMarshalJSON(t, test.local)
+			var roundTrip runtimeacp.EmbeddedResource
+			if err := json.Unmarshal(raw, &roundTrip); err != nil {
+				t.Fatalf("unmarshal %s: %v", raw, err)
+			}
+			kind, err := roundTrip.ContentKind()
+			if err != nil || kind != test.kind {
+				t.Fatalf("round-trip kind = %q, %v; want %q", kind, err, test.kind)
+			}
+		})
+	}
+}
+
+func TestEmbeddedResourceRejectsNullRequiredValues(t *testing.T) {
+	for _, raw := range []string{
+		`{"uri":null,"text":"content"}`,
+		`{"uri":"memory:///null","text":null}`,
+		`{"uri":"memory:///null","blob":null}`,
+	} {
+		var resource runtimeacp.EmbeddedResource
+		if err := json.Unmarshal([]byte(raw), &resource); err == nil {
+			t.Fatalf("json.Unmarshal(%s) succeeded, want required string error", raw)
+		}
+	}
+}
+
 func TestMCPAgentCapabilitiesMatchCoderSDKJSONShape(t *testing.T) {
 	assertSameJSONShape(t,
 		runtimeacp.MCPAgentCapabilities{

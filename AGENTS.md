@@ -21,6 +21,15 @@ invariants remain covered by tests: ordered method dispatch, concurrent
 cancel/notification behavior, JSON-RPC error handling, distinct outbound request
 IDs, and the 1 MiB message cap.
 
+For command-backed rich file inputs, keep staging provider-neutral and
+fail-closed. Darwin, Linux, and Windows are the supported security backends.
+Preserve full ancestor validation, retained path identities, private
+owner/mode-or-DACL enforcement, trusted local-filesystem checks, pre-builder and
+pre-launch verification, and exact handle-relative cleanup. Do not replace
+exact cleanup with a recursive delete through a re-resolved path, broaden the
+Linux filesystem allowlist without a security review, or expose source-local
+file URIs or ephemeral stage paths in errors, activity, output, or transcripts.
+
 When changing shared behavior, add or update focused kit tests first, then run:
 
 ```sh

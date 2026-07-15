@@ -114,8 +114,9 @@ type Spec struct {
 	// PromptResourceLimits bounds prompt-scoped local file preparation.
 	PromptResourceLimits PromptResourceLimits
 	// PromptResourceTempDir selects the parent for private prompt directories.
-	// It must be absolute. The operating-system temporary directory is used when
-	// it is empty.
+	// It must be an absolute trusted local directory: canonical ancestors must
+	// satisfy the platform ownership, ACL, and non-reparse rules. The
+	// operating-system temporary directory is used when it is empty.
 	PromptResourceTempDir string
 }
 
@@ -126,10 +127,16 @@ type Bridge struct {
 
 	mu       sync.Mutex
 	sessions map[string]*sessionState
-	active   map[string]context.CancelFunc
+	active   map[string]*activePrompt
 
-	removePromptResourceDir func(string) error
-	promptMethodContext     func(*acp.MethodContext) context.Context
+	promptResourceCleanupHook func(string) error
+	promptMethodContext       func(*acp.MethodContext) context.Context
+	promptStagePrepared       func(*promptResourceStage)
+}
+
+type activePrompt struct {
+	cancel    context.CancelFunc
+	finalized bool
 }
 
 type Session struct {
@@ -196,7 +203,7 @@ func New(spec Spec) *Bridge {
 	return &Bridge{
 		spec:     spec,
 		sessions: map[string]*sessionState{},
-		active:   map[string]context.CancelFunc{},
+		active:   map[string]*activePrompt{},
 	}
 }
 
@@ -490,17 +497,18 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	runCtx, cancel := context.WithCancel(baseCtx)
-	if beginErr := b.beginPrompt(req.SessionID, cancel); beginErr != nil {
+	promptToken, beginErr := b.beginPrompt(req.SessionID, cancel)
+	if beginErr != nil {
 		cancel()
 		return nil, beginErr
 	}
-	defer b.endPrompt(req.SessionID)
+	defer b.endPrompt(req.SessionID, promptToken)
 	defer cancel()
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 
-	preparedParams, stage, err := preparePromptResources(runCtx, req, b.spec.PromptResourceLimits, b.spec.PromptResourceTempDir, b.removePromptResourceDir)
+	preparedParams, stage, err := preparePromptResources(runCtx, req, b.spec.PromptResourceLimits, b.spec.PromptResourceTempDir, b.promptResourceCleanupHook)
 	if err != nil {
 		var cleanupErr *promptResourceCleanupError
 		if errors.As(err, &cleanupErr) {
@@ -528,17 +536,28 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 	promptSession := state.Session
 	if stage != nil {
 		promptSession.AdditionalDirectories = append(cloneStrings(promptSession.AdditionalDirectories), stage.dir)
+		if b.promptStagePrepared != nil {
+			b.promptStagePrepared(stage)
+		}
+		if verifyErr := stage.verify(); verifyErr != nil {
+			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource stage verification failed", Data: promptRedactor.RedactFinal(verifyErr.Error())}
+		}
 	}
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	command, err := b.spec.BuildPrompt(promptSession, promptParams)
 	if err != nil {
-		return nil, invalidParams("build prompt command", promptRedactor.Redact(err.Error()))
+		return nil, invalidParams("build prompt command", promptRedactor.RedactFinal(err.Error()))
 	}
 	parser := b.newStreamParser(state.Session, promptParams)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
+	if stage != nil {
+		if verifyErr := stage.verify(); verifyErr != nil {
+			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource stage verification failed", Data: promptRedactor.RedactFinal(verifyErr.Error())}
+		}
 	}
 	result, assistantText, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command, parser, promptRedactor)
 	if runCtx.Err() != nil {
@@ -547,27 +566,30 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 	if err != nil {
 		if b.authRequired(result, err) {
 			return nil, authRequired(commandErrorData(
-				redactPromptCommandResult(result, promptRedactor.Redact),
-				redactPromptCommandError(err, promptRedactor.Redact),
+				redactPromptCommandResult(result, promptRedactor.RedactFinal),
+				redactPromptCommandError(err, promptRedactor.RedactFinal),
 			))
 		}
 		data := commandErrorData(
-			redactPromptCommandResult(result, promptRedactor.Redact),
-			redactPromptCommandError(err, promptRedactor.Redact),
+			redactPromptCommandResult(result, promptRedactor.RedactFinal),
+			redactPromptCommandError(err, promptRedactor.RedactFinal),
 		)
 		if kind := b.classifyPromptFailure(state.Session, command, result, err); kind != "" {
 			data["errorKind"] = kind
 		}
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
-	assistantTranscriptText := promptRedactor.Redact(assistantText)
+	assistantTranscriptText := promptRedactor.RedactFinal(assistantText)
 	if stage != nil {
 		if cleanupErr := stage.cleanup(); cleanupErr != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource cleanup failed", Data: cleanupErr.Error()}
 		}
 	}
-	b.recordPromptSuccess(req.SessionID)
-	if info, ok := b.recordTranscriptExchange(req.SessionID, promptTranscriptText(req), assistantTranscriptText); ok {
+	info, notifyInfo, committed := b.finalizePromptSuccess(req.SessionID, promptToken, runCtx, promptTranscriptText(req), assistantTranscriptText)
+	if !committed {
+		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
+	if notifyInfo {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
@@ -585,10 +607,10 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 	if err := runCtx.Err(); err != nil {
 		return adapterprocess.Result{}, "", err
 	}
-	redact := redactor.Redact
+	redactFinal := redactor.RedactFinal
 	notificationCommand := command
-	notificationCommand.Command = redact(notificationCommand.Command)
-	notificationCommand.Dir = redact(notificationCommand.Dir)
+	notificationCommand.Command = redactFinal(notificationCommand.Command)
+	notificationCommand.Dir = redactFinal(notificationCommand.Dir)
 	toolCallID := b.newToolCallID()
 	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, notificationCommand); err != nil {
 		return adapterprocess.Result{}, "", fmt.Errorf("notify prompt tool start: %w", err)
@@ -626,7 +648,7 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			if parseErr != nil {
 				return parseErr
 			}
-			return handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redact))
+			return handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redactFinal))
 		})
 		if parser == nil {
 			if runCtx.Err() == nil && err == nil {
@@ -647,7 +669,7 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 				if flushErr != nil && err == nil {
 					err = flushErr
 				}
-				if notifyErr := handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redact)); notifyErr != nil && err == nil {
+				if notifyErr := handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redactFinal)); notifyErr != nil && err == nil {
 					err = notifyErr
 				}
 				if runCtx.Err() == nil {
@@ -661,15 +683,15 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			finishResult.StdoutTruncated = false
 		}
 		finishResult = promptCommandResultForFinish(finishResult, runCtx.Err())
-		finishResult = redactPromptCommandResult(finishResult, redact)
-		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redact), runCtx.Err()); notifyErr != nil && err == nil {
+		finishResult = redactPromptCommandResult(finishResult, redactFinal)
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redactFinal), runCtx.Err()); notifyErr != nil && err == nil {
 			err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 		}
 		return result, assistantText.String(), err
 	}
 	result, err := b.spec.Runner.Run(runCtx, command)
 	contextErr := runCtx.Err()
-	text := strings.TrimSpace(redact(string(result.Stdout)))
+	text := strings.TrimSpace(redactFinal(string(result.Stdout)))
 	if contextErr == nil && text != "" {
 		if contextErr = runCtx.Err(); contextErr != nil {
 			text = ""
@@ -679,8 +701,8 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 	}
 	contextErr = runCtx.Err()
 	finishResult := promptCommandResultForFinish(result, contextErr)
-	finishResult = redactPromptCommandResult(finishResult, redact)
-	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redact), contextErr); notifyErr != nil && err == nil {
+	finishResult = redactPromptCommandResult(finishResult, redactFinal)
+	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redactFinal), contextErr); notifyErr != nil && err == nil {
 		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 	}
 	return result, string(result.Stdout), err
@@ -829,20 +851,22 @@ func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.Prom
 	return out
 }
 
-func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText string) (sessionInfo, bool) {
-	if !b.spec.IncludeTranscript {
-		return sessionInfo{}, false
-	}
+func (b *Bridge) finalizePromptSuccess(sessionID string, prompt *activePrompt, runCtx context.Context, userText, assistantText string) (sessionInfo, bool, bool) {
 	userText = strings.TrimSpace(userText)
 	assistantText = strings.TrimSpace(assistantText)
-	if userText == "" && assistantText == "" {
-		return sessionInfo{}, false
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if runCtx == nil || runCtx.Err() != nil || prompt == nil || prompt.finalized || b.active[sessionID] != prompt {
+		return sessionInfo{}, false, false
+	}
 	state := b.sessions[sessionID]
 	if state == nil {
-		return sessionInfo{}, false
+		return sessionInfo{}, false, false
+	}
+	prompt.finalized = true
+	state.PromptCount++
+	if !b.spec.IncludeTranscript || userText == "" && assistantText == "" {
+		return sessionInfo{}, false, true
 	}
 	if state.Title == "" {
 		state.Title = sessionTitle(userText)
@@ -855,17 +879,7 @@ func (b *Bridge) recordTranscriptExchange(sessionID, userText, assistantText str
 	if max := b.maxTranscriptExchanges(); max > 0 && len(state.transcript) > max {
 		state.transcript = append([]transcriptExchange(nil), state.transcript[len(state.transcript)-max:]...)
 	}
-	return sessionInfo{Title: state.Title, UpdatedAt: state.UpdatedAt}, true
-}
-
-func (b *Bridge) recordPromptSuccess(sessionID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	state := b.sessions[sessionID]
-	if state == nil {
-		return
-	}
-	state.PromptCount++
+	return sessionInfo{Title: state.Title, UpdatedAt: state.UpdatedAt}, true, true
 }
 
 func sessionTitle(text string) string {
@@ -971,7 +985,7 @@ func handleStreamEvents(runCtx context.Context, ctx *acp.MethodContext, sessionI
 			if err := runCtx.Err(); err != nil {
 				return err
 			}
-			if err := requestStreamPermission(ctx, sessionID, *event.PermissionRequest); err != nil {
+			if err := requestStreamPermission(runCtx, ctx, sessionID, *event.PermissionRequest); err != nil {
 				return err
 			}
 		}
@@ -979,8 +993,8 @@ func handleStreamEvents(runCtx context.Context, ctx *acp.MethodContext, sessionI
 	return nil
 }
 
-func requestStreamPermission(ctx *acp.MethodContext, sessionID string, req PermissionRequest) error {
-	raw, rpcErr, err := ctx.Request("session/request_permission", permissionRequestParams(sessionID, req))
+func requestStreamPermission(runCtx context.Context, ctx *acp.MethodContext, sessionID string, req PermissionRequest) error {
+	raw, rpcErr, err := ctx.RequestContext(runCtx, "session/request_permission", permissionRequestParams(sessionID, req))
 	if err != nil {
 		return fmt.Errorf("request permission: %w", err)
 	}
@@ -1327,30 +1341,33 @@ func (b *Bridge) notifyAvailableCommands(ctx *acp.MethodContext, sessionID strin
 	})
 }
 
-func (b *Bridge) beginPrompt(sessionID string, cancel context.CancelFunc) *acp.RPCError {
+func (b *Bridge) beginPrompt(sessionID string, cancel context.CancelFunc) (*activePrompt, *acp.RPCError) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.active[sessionID] != nil {
-		return &acp.RPCError{Code: -32009, Message: "session busy", Data: sessionID}
+		return nil, &acp.RPCError{Code: -32009, Message: "session busy", Data: sessionID}
 	}
-	b.active[sessionID] = cancel
-	return nil
+	prompt := &activePrompt{cancel: cancel}
+	b.active[sessionID] = prompt
+	return prompt, nil
 }
 
-func (b *Bridge) endPrompt(sessionID string) {
+func (b *Bridge) endPrompt(sessionID string, prompt *activePrompt) {
 	b.mu.Lock()
-	delete(b.active, sessionID)
+	if b.active[sessionID] == prompt {
+		delete(b.active, sessionID)
+	}
 	b.mu.Unlock()
 }
 
 func (b *Bridge) cancel(sessionID string) bool {
 	b.mu.Lock()
-	cancel := b.active[sessionID]
-	b.mu.Unlock()
-	if cancel == nil {
+	defer b.mu.Unlock()
+	prompt := b.active[sessionID]
+	if prompt == nil || prompt.finalized || prompt.cancel == nil {
 		return false
 	}
-	cancel()
+	prompt.cancel()
 	return true
 }
 

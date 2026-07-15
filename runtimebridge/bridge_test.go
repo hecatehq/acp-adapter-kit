@@ -273,12 +273,9 @@ func TestPromptForwardsDynamicSessionUpdates(t *testing.T) {
 func TestPromptForwardsRuntimeChildRequestAndReturnsClientResponse(t *testing.T) {
 	runtime := newFakeRuntimeClient()
 	runtime.childRequest = true
-	client := newBridgeClient(t, runtime)
+	client := newBridgeLiveChildResponseClient(t, runtime, `{"outcome":"approved"}`)
 
-	envelopes := client.SendRaw(strings.Join([]string{
-		`{"jsonrpc":"2.0","id":"prompt-1","method":"session/prompt","params":{"sessionId":"sess-bridge","prompt":[{"type":"text","text":"needs permission"}]}}`,
-		`{"jsonrpc":"2.0","id":"server-1","result":{"outcome":"approved"}}`,
-	}, "\n") + "\n")
+	envelopes := client.PromptText("prompt-1", "sess-bridge", "needs permission", time.Second)
 	if len(envelopes) != 2 {
 		t.Fatalf("got %d envelopes, want child request + prompt response", len(envelopes))
 	}
@@ -310,12 +307,9 @@ func TestPromptForwardsRuntimeMCPChildRequestAndReturnsClientResponse(t *testing
 	runtime.childRequest = true
 	runtime.childRequestMethod = "mcp/message"
 	runtime.childRequestParams = json.RawMessage(`{"connectionId":"mcp-conn","method":"tools/list","params":{"cursor":"next"}}`)
-	client := newBridgeClient(t, runtime)
+	client := newBridgeLiveChildResponseClient(t, runtime, `{"tools":[{"name":"read"}]}`)
 
-	envelopes := client.SendRaw(strings.Join([]string{
-		`{"jsonrpc":"2.0","id":"prompt-1","method":"session/prompt","params":{"sessionId":"sess-bridge","prompt":[{"type":"text","text":"needs tools"}]}}`,
-		`{"jsonrpc":"2.0","id":"server-1","result":{"tools":[{"name":"read"}]}}`,
-	}, "\n") + "\n")
+	envelopes := client.PromptText("prompt-1", "sess-bridge", "needs tools", time.Second)
 	if len(envelopes) != 2 {
 		t.Fatalf("got %d envelopes, want MCP child request + prompt response", len(envelopes))
 	}
@@ -395,12 +389,9 @@ func TestPromptForwardsRuntimeTerminalChildRequests(t *testing.T) {
 			runtime.childRequest = true
 			runtime.childRequestMethod = tt.method
 			runtime.childRequestParams = tt.params
-			client := newBridgeClient(t, runtime)
+			client := newBridgeLiveChildResponseClient(t, runtime, tt.clientResult)
 
-			envelopes := client.SendRaw(strings.Join([]string{
-				`{"jsonrpc":"2.0","id":"prompt-1","method":"session/prompt","params":{"sessionId":"sess-bridge","prompt":[{"type":"text","text":"needs terminal"}]}}`,
-				`{"jsonrpc":"2.0","id":"server-1","result":` + tt.clientResult + `}`,
-			}, "\n") + "\n")
+			envelopes := client.PromptText("prompt-1", "sess-bridge", "needs terminal", time.Second)
 			if len(envelopes) != 2 {
 				t.Fatalf("got %d envelopes, want terminal child request + prompt response", len(envelopes))
 			}
@@ -1068,6 +1059,25 @@ func newBridgeClient(t testing.TB, runtime *fakeRuntimeClient) *acptest.Client {
 	t.Helper()
 	server := acp.NewServer(acp.AdapterInfo{Name: "test"}, runtimebridge.New(runtime).Options()...)
 	return acptest.NewClient(t, server)
+}
+
+func newBridgeLiveChildResponseClient(t testing.TB, runtime *fakeRuntimeClient, result string) *acptest.LiveClient {
+	t.Helper()
+	server := acp.NewServer(acp.AdapterInfo{Name: "test"}, runtimebridge.New(runtime).Options()...)
+	return acptest.NewLiveClient(t, server, acptest.WithLiveResponseHandler(func(client *acptest.LiveClient, response acptest.Response) {
+		if response.Method == "" || len(response.ID) == 0 {
+			return
+		}
+		client.Write(struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Result  json.RawMessage `json:"result"`
+		}{
+			JSONRPC: "2.0",
+			ID:      append(json.RawMessage(nil), response.ID...),
+			Result:  json.RawMessage(result),
+		})
+	}))
 }
 
 func readBridgeResponseLine(t testing.TB, reader *bufio.Reader) acptest.Response {

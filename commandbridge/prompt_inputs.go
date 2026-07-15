@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -135,7 +136,14 @@ func PreparedPromptInputs(params runtimeacp.PromptParams) ([]PreparedPromptInput
 			if err := validateAbsoluteURI(block.Resource.URI); err != nil {
 				return nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
 			}
+			resourceKind, err := block.Resource.ContentKind()
+			if err != nil {
+				return nil, fmt.Errorf("prompt block %d: %w", index, err)
+			}
 			if block.PreparedFile != nil {
+				if resourceKind != runtimeacp.EmbeddedResourceBlob {
+					return nil, fmt.Errorf("prompt block %d: embedded text cannot have a prepared file", index)
+				}
 				preparedPath, err := validatedPreparedPath(index, block)
 				if err != nil {
 					return nil, err
@@ -155,16 +163,17 @@ func PreparedPromptInputs(params runtimeacp.PromptParams) ([]PreparedPromptInput
 				input.Name = firstNonEmpty(input.Name, resourceDisplayName(block.Resource.URI, filepath.Base(preparedPath)))
 				break
 			}
-			if block.Resource.Blob != "" {
+			if resourceKind == runtimeacp.EmbeddedResourceBlob {
 				return nil, fmt.Errorf("prompt block %d: embedded blob was not prepared", index)
-			}
-			if block.Resource.Text == "" {
-				return nil, fmt.Errorf("prompt block %d: embedded resource has no content", index)
 			}
 			input.Kind = PreparedInputEmbeddedText
 			input.Text = block.Resource.Text
-			input.URI = block.Resource.URI
-			input.Name = firstNonEmpty(input.Name, resourceDisplayName(input.URI, "resource"))
+			input.Name = firstNonEmpty(input.Name, resourceDisplayName(block.Resource.URI, "resource"))
+			safeURI, err := safePreparedOriginalURI(block.Resource.URI)
+			if err != nil {
+				return nil, fmt.Errorf("prompt block %d: invalid embedded resource URI metadata: %w", index, err)
+			}
+			input.URI = safeURI
 			input.MimeType = block.Resource.MimeType
 		case "resource_link":
 			if block.Text != "" || block.Data != "" || block.Resource != nil {
@@ -306,34 +315,57 @@ func scrubPromptResourcePaths(text string, params runtimeacp.PromptParams, stage
 }
 
 type promptResourceRedactor struct {
-	aliases []string
+	aliases         []string
+	caseInsensitive bool
 }
 
 func newPromptResourceRedactor(params runtimeacp.PromptParams, stageDir string) promptResourceRedactor {
-	aliases := make([]string, 0, len(params.Prompt)*4+4)
+	return newPromptResourceRedactorForOS(params, stageDir, runtime.GOOS)
+}
+
+func newPromptResourceRedactorForOS(params runtimeacp.PromptParams, stageDir, goos string) promptResourceRedactor {
+	aliases := make([]string, 0, len(params.Prompt)*8+16)
 	seen := map[string]struct{}{}
-	addAlias := func(alias string) {
+	caseInsensitive := goos == "windows"
+	aliasKey := func(alias string) string {
+		if caseInsensitive {
+			return strings.ToLower(strings.ReplaceAll(alias, `\`, "/"))
+		}
+		return alias
+	}
+	addExactAlias := func(alias string) {
 		if alias == "" || alias == "." || alias == string(filepath.Separator) {
 			return
 		}
-		if _, exists := seen[alias]; exists {
+		key := aliasKey(alias)
+		if _, exists := seen[key]; exists {
 			return
 		}
-		seen[alias] = struct{}{}
+		seen[key] = struct{}{}
 		aliases = append(aliases, alias)
+	}
+	addAlias := func(alias string) {
+		addExactAlias(alias)
+		if quoted := strconv.Quote(alias); len(quoted) >= 2 {
+			addExactAlias(quoted[1 : len(quoted)-1])
+		}
+		if raw, err := json.Marshal(alias); err == nil && len(raw) >= 2 {
+			addExactAlias(string(raw[1 : len(raw)-1]))
+		}
 	}
 	addPath := func(localPath string) {
 		if localPath == "" {
 			return
 		}
 		paths := []string{localPath}
-		if resolved, err := filepath.EvalSymlinks(localPath); err == nil {
-			paths = append(paths, resolved)
+		if goos == runtime.GOOS {
+			if resolved, err := filepath.EvalSymlinks(localPath); err == nil {
+				paths = append(paths, resolved)
+			}
 		}
 		for _, candidate := range paths {
 			addAlias(candidate)
-			addAlias(fileURIFromPath(candidate))
-			addAlias(filepath.Base(candidate))
+			addAlias(fileURIFromPathForOS(candidate, goos))
 		}
 	}
 	for _, block := range params.Prompt {
@@ -343,17 +375,104 @@ func newPromptResourceRedactor(params runtimeacp.PromptParams, stageDir string) 
 		addPath(block.PreparedFile.Path)
 	}
 	addPath(stageDir)
+	addPath(promptResourcePathDir(stageDir, goos))
 	sort.SliceStable(aliases, func(left, right int) bool {
 		return len(aliases[left]) > len(aliases[right])
 	})
-	return promptResourceRedactor{aliases: aliases}
+	return promptResourceRedactor{aliases: aliases, caseInsensitive: caseInsensitive}
 }
 
 func (r promptResourceRedactor) Redact(text string) string {
 	for _, alias := range r.aliases {
-		text = strings.ReplaceAll(text, alias, "[prompt-resource]")
+		text = replaceAllPromptResourceAlias(text, alias, "[prompt-resource]", r.caseInsensitive)
 	}
 	return text
+}
+
+const minPromptResourceBoundaryFragmentBytes = 6
+
+func (r promptResourceRedactor) RedactFinal(text string) string {
+	text = r.Redact(text)
+	for _, alias := range r.aliases {
+		if len(alias) <= minPromptResourceBoundaryFragmentBytes {
+			continue
+		}
+		for fragmentBytes := len(alias) - 1; fragmentBytes >= minPromptResourceBoundaryFragmentBytes; fragmentBytes-- {
+			fragment := alias[len(alias)-fragmentBytes:]
+			if promptResourceFragmentIsPathLike(fragment) && len(text) >= fragmentBytes && promptResourceAliasEqual(text[:fragmentBytes], fragment, r.caseInsensitive) {
+				text = "[prompt-resource]" + text[fragmentBytes:]
+				break
+			}
+		}
+		for fragmentBytes := len(alias) - 1; fragmentBytes >= minPromptResourceBoundaryFragmentBytes; fragmentBytes-- {
+			fragment := alias[:fragmentBytes]
+			if promptResourceFragmentIsPathLike(fragment) && len(text) >= fragmentBytes && promptResourceAliasEqual(text[len(text)-fragmentBytes:], fragment, r.caseInsensitive) {
+				text = text[:len(text)-fragmentBytes] + "[prompt-resource]"
+				break
+			}
+		}
+	}
+	return text
+}
+
+func promptResourceFragmentIsPathLike(fragment string) bool {
+	return strings.ContainsAny(fragment, `/\`)
+}
+
+func promptResourcePathDir(localPath, goos string) string {
+	if localPath == "" {
+		return ""
+	}
+	if goos == "windows" {
+		slashPath := strings.ReplaceAll(localPath, `\`, "/")
+		dir := path.Dir(slashPath)
+		return strings.ReplaceAll(dir, "/", `\`)
+	}
+	return filepath.Dir(localPath)
+}
+
+func replaceAllPromptResourceAlias(text, alias, replacement string, caseInsensitive bool) string {
+	if alias == "" {
+		return text
+	}
+	var out strings.Builder
+	for {
+		index := indexPromptResourceAlias(text, alias, caseInsensitive)
+		if index < 0 {
+			out.WriteString(text)
+			return out.String()
+		}
+		out.WriteString(text[:index])
+		out.WriteString(replacement)
+		text = text[index+len(alias):]
+	}
+}
+
+func indexPromptResourceAlias(text, alias string, caseInsensitive bool) int {
+	if !caseInsensitive {
+		return strings.Index(text, alias)
+	}
+	if len(alias) > len(text) {
+		return -1
+	}
+	for index := 0; index+len(alias) <= len(text); index++ {
+		if promptResourceAliasEqual(text[index:index+len(alias)], alias, true) {
+			return index
+		}
+	}
+	return -1
+}
+
+func promptResourceAliasEqual(left, right string, caseInsensitive bool) bool {
+	if !caseInsensitive {
+		return left == right
+	}
+	if len(left) != len(right) {
+		return false
+	}
+	left = strings.ReplaceAll(left, `\`, "/")
+	right = strings.ReplaceAll(right, `\`, "/")
+	return strings.EqualFold(left, right)
 }
 
 type promptResourceStreamRedactor struct {
@@ -391,7 +510,7 @@ func (r *promptResourceStreamRedactor) Push(text string) string {
 				searchFrom = 0
 			}
 			for {
-				index := strings.Index(r.pending[searchFrom:], alias)
+				index := indexPromptResourceAlias(r.pending[searchFrom:], alias, r.redactor.caseInsensitive)
 				if index < 0 {
 					break
 				}
@@ -420,7 +539,7 @@ func (r *promptResourceStreamRedactor) Flush() string {
 	if r == nil {
 		return ""
 	}
-	out := r.redactor.Redact(r.pending)
+	out := r.redactor.RedactFinal(r.pending)
 	r.pending = ""
 	return out
 }
@@ -440,9 +559,19 @@ type promptResourceCandidate struct {
 	base64Data  string
 }
 
+type promptResourceStageGuard interface {
+	Secure() error
+	ProtectFile(string) error
+	Seal() error
+	Verify() error
+	Cleanup(func(string) error) error
+}
+
 type promptResourceStage struct {
-	dir       string
-	removeAll func(string) error
+	dir         string
+	anchor      string
+	cleanupHook func(string) error
+	guard       promptResourceStageGuard
 }
 
 type promptResourceCleanupError struct {
@@ -461,22 +590,32 @@ func (s *promptResourceStage) cleanup() error {
 	if s == nil || s.dir == "" {
 		return nil
 	}
-	dir := s.dir
-	s.dir = ""
-	removeAll := s.removeAll
-	if removeAll == nil {
-		removeAll = os.RemoveAll
+	if s.guard == nil {
+		return &promptResourceCleanupError{err: errors.New("private prompt resource identity protection is unavailable")}
 	}
-	if info, err := os.Lstat(dir); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
-		_ = os.Chmod(dir, 0o700)
-	}
-	if err := removeAll(dir); err != nil {
+	if err := s.guard.Cleanup(s.cleanupHook); err != nil {
 		return &promptResourceCleanupError{err: err}
+	}
+	s.dir = ""
+	s.anchor = ""
+	s.guard = nil
+	return nil
+}
+
+func (s *promptResourceStage) verify() error {
+	if s == nil || s.dir == "" || s.guard == nil {
+		return errors.New("private prompt resource stage is unavailable")
+	}
+	if err := s.guard.Verify(); err != nil {
+		return fmt.Errorf("private prompt resource stage changed: %w", err)
+	}
+	if err := verifyPromptResourceStageSecurity(s.dir); err != nil {
+		return fmt.Errorf("private prompt resource stage is not secure: %w", err)
 	}
 	return nil
 }
 
-func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams, limits PromptResourceLimits, tempDir string, removeAll func(string) error) (runtimeacp.PromptParams, *promptResourceStage, error) {
+func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams, limits PromptResourceLimits, tempDir string, cleanupHook func(string) error) (runtimeacp.PromptParams, *promptResourceStage, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -522,10 +661,11 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			if err := validateAbsoluteURI(block.Resource.URI); err != nil {
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
 			}
-			if block.Resource.Text != "" && block.Resource.Blob != "" {
-				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: embedded resource cannot contain text and blob", index)
+			resourceKind, err := block.Resource.ContentKind()
+			if err != nil {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: %w", index, err)
 			}
-			if block.Resource.Blob != "" {
+			if resourceKind == runtimeacp.EmbeddedResourceBlob {
 				originalURI, err := safePreparedOriginalURI(block.Resource.URI)
 				if err != nil {
 					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
@@ -575,29 +715,34 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		}
 		return out, nil, nil
 	}
-	if tempDir != "" && !filepath.IsAbs(tempDir) {
-		return runtimeacp.PromptParams{}, nil, errors.New("prompt resource temporary parent must be absolute")
+	tempParent, err := preparePromptResourceParent(tempDir)
+	if err != nil {
+		return runtimeacp.PromptParams{}, nil, fmt.Errorf("validate prompt resource temporary parent: %w", scrubPathError(err))
 	}
 
-	dir, err := os.MkdirTemp(tempDir, "acp-commandbridge-prompt-")
+	anchor, dir, guard, err := createPromptResourceStage(tempParent)
 	if err != nil {
-		return runtimeacp.PromptParams{}, nil, errors.New("create private prompt resource directory")
+		return runtimeacp.PromptParams{}, nil, fmt.Errorf("create protected prompt resource stage: %w", scrubPathError(err))
 	}
-	createdDir := dir
-	dir, err = filepath.Abs(createdDir)
-	if err != nil {
-		_ = os.RemoveAll(createdDir)
-		return runtimeacp.PromptParams{}, nil, errors.New("resolve private prompt resource directory")
-	}
-	stage := &promptResourceStage{dir: dir, removeAll: removeAll}
+	stage := &promptResourceStage{dir: dir, anchor: anchor, cleanupHook: cleanupHook, guard: guard}
 	fail := func(cause error) (runtimeacp.PromptParams, *promptResourceStage, error) {
 		if cleanupErr := stage.cleanup(); cleanupErr != nil {
 			return runtimeacp.PromptParams{}, nil, errors.Join(cause, cleanupErr)
 		}
 		return runtimeacp.PromptParams{}, nil, cause
 	}
-	if err := securePromptResourceStage(dir); err != nil {
+	if err := stage.guard.Secure(); err != nil {
 		return fail(fmt.Errorf("secure private prompt resource directory: %w", scrubPathError(err)))
+	}
+	if err := stage.verify(); err != nil {
+		return fail(fmt.Errorf("verify private prompt resource directory: %w", scrubPathError(err)))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fail(errors.New("inspect private prompt resource directory"))
+	}
+	if len(entries) != 0 {
+		return fail(errors.New("private prompt resource directory was not empty after protection"))
 	}
 
 	var totalBytes int64
@@ -635,7 +780,7 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			reader = io.NopCloser(base64.NewDecoder(base64.StdEncoding, strings.NewReader(candidate.base64Data)))
 		}
 
-		written, writeErr := writePrivatePromptResource(ctx, destination, reader, maxBytes)
+		written, writeErr := writePrivatePromptResource(ctx, destination, reader, maxBytes, stage.guard.ProtectFile)
 		closeErr := reader.Close()
 		if writeErr != nil {
 			if errors.Is(writeErr, errPromptResourceSizeLimit) {
@@ -663,6 +808,7 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		case "resource":
 			resource := *block.Resource
 			resource.Blob = ""
+			resource.Kind = runtimeacp.EmbeddedResourceBlob
 			resource.URI = stagedURI
 			block.Resource = &resource
 			block.Name = candidate.name
@@ -675,8 +821,11 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 	if _, err := PreparedPromptInputs(out); err != nil {
 		return fail(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
+	if err := stage.guard.Seal(); err != nil {
 		return fail(errors.New("seal private prompt resource directory"))
+	}
+	if err := stage.verify(); err != nil {
+		return fail(fmt.Errorf("verify sealed prompt resource directory: %w", scrubPathError(err)))
 	}
 	return out, stage, nil
 }
@@ -712,7 +861,7 @@ func normalizedPromptResourceLimits(limits PromptResourceLimits) PromptResourceL
 	return limits
 }
 
-func writePrivatePromptResource(ctx context.Context, destination string, reader io.Reader, maxBytes int64) (int64, error) {
+func writePrivatePromptResource(ctx context.Context, destination string, reader io.Reader, maxBytes int64, protect func(string) error) (int64, error) {
 	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return 0, errors.New("create staged resource")
@@ -723,8 +872,14 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 			_ = file.Close()
 		}
 	}()
-	if err := verifyPrivatePromptResourceFile(file); err != nil {
+	if err := securePrivatePromptResourceFile(file, 0o600); err != nil {
 		return 0, errors.New("verify staged resource permissions")
+	}
+	if protect == nil {
+		return 0, errors.New("staged resource identity protection is unavailable")
+	}
+	if err := protect(destination); err != nil {
+		return 0, errors.New("retain staged resource identity")
 	}
 
 	buffer := make([]byte, 32*1024)
@@ -761,13 +916,13 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 			return written, errors.New("resource reader made no progress")
 		}
 	}
+	if err := securePrivatePromptResourceFile(file, 0o400); err != nil {
+		return written, errors.New("secure staged resource")
+	}
 	if err := file.Close(); err != nil {
 		return written, errors.New("close staged resource")
 	}
 	closed = true
-	if err := os.Chmod(destination, 0o400); err != nil {
-		return written, errors.New("secure staged resource")
-	}
 	return written, nil
 }
 
