@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -55,14 +56,17 @@ const (
 
 // PreparedPromptInput is a provider-neutral view of one prepared ACP prompt
 // block. Path is set only for a private prompt-scoped local file. URI is set
-// only for a non-local link or embedded-text identifier. Index is the zero-based
-// block position in the PromptParams supplied to the prompt builder.
+// only for a non-local link or embedded-text identifier. OriginalURI preserves
+// non-local standard metadata from a materialized image or embedded blob;
+// source-local file URIs are never exposed. Index is the zero-based block
+// position in the PromptParams supplied to the prompt builder.
 type PreparedPromptInput struct {
 	Index       int
 	Kind        PreparedInputKind
 	Text        string
 	Path        string
 	URI         string
+	OriginalURI string
 	Name        string
 	Title       string
 	Description string
@@ -112,6 +116,11 @@ func PreparedPromptInputs(params runtimeacp.PromptParams) ([]PreparedPromptInput
 				input.Kind = PreparedInputAudio
 			}
 			input.Path = preparedPath
+			originalURI, err := validatedPreparedOriginalURI(index, block.PreparedFile.OriginalURI)
+			if err != nil {
+				return nil, err
+			}
+			input.OriginalURI = originalURI
 			input.SizeBytes = int64Pointer(block.PreparedFile.SizeBytes)
 			if strings.TrimSpace(input.Name) == "" {
 				input.Name = filepath.Base(preparedPath)
@@ -136,6 +145,11 @@ func PreparedPromptInputs(params runtimeacp.PromptParams) ([]PreparedPromptInput
 				}
 				input.Kind = PreparedInputEmbeddedBlob
 				input.Path = preparedPath
+				originalURI, err := validatedPreparedOriginalURI(index, block.PreparedFile.OriginalURI)
+				if err != nil {
+					return nil, err
+				}
+				input.OriginalURI = originalURI
 				input.SizeBytes = int64Pointer(block.PreparedFile.SizeBytes)
 				input.MimeType = block.Resource.MimeType
 				input.Name = firstNonEmpty(input.Name, resourceDisplayName(block.Resource.URI, filepath.Base(preparedPath)))
@@ -192,6 +206,20 @@ func PreparedPromptInputs(params runtimeacp.PromptParams) ([]PreparedPromptInput
 	return inputs, nil
 }
 
+func validatedPreparedOriginalURI(index int, rawURI string) (string, error) {
+	if rawURI == "" {
+		return "", nil
+	}
+	originalURI, err := safePreparedOriginalURI(rawURI)
+	if err != nil {
+		return "", fmt.Errorf("prompt block %d: invalid original URI metadata: %w", index, err)
+	}
+	if originalURI == "" {
+		return "", fmt.Errorf("prompt block %d: original URI metadata cannot expose a local file", index)
+	}
+	return originalURI, nil
+}
+
 func validatedPreparedPath(index int, block runtimeacp.ContentBlock) (string, error) {
 	if block.PreparedFile == nil || strings.TrimSpace(block.PreparedFile.Path) == "" {
 		return "", fmt.Errorf("prompt block %d: binary content was not prepared", index)
@@ -238,6 +266,7 @@ func promptInputMetadata(input PreparedPromptInput) string {
 		Text        string            `json:"text,omitempty"`
 		Path        string            `json:"path,omitempty"`
 		URI         string            `json:"uri,omitempty"`
+		OriginalURI string            `json:"originalUri,omitempty"`
 		Name        string            `json:"name,omitempty"`
 		Title       string            `json:"title,omitempty"`
 		Description string            `json:"description,omitempty"`
@@ -250,6 +279,7 @@ func promptInputMetadata(input PreparedPromptInput) string {
 		Text:        input.Text,
 		Path:        input.Path,
 		URI:         input.URI,
+		OriginalURI: input.OriginalURI,
 		Name:        input.Name,
 		Title:       input.Title,
 		Description: input.Description,
@@ -272,36 +302,142 @@ func promptTranscriptText(params runtimeacp.PromptParams) string {
 }
 
 func scrubPromptResourcePaths(text string, params runtimeacp.PromptParams, stageDir string) string {
-	if stageDir == "" {
-		return text
+	return newPromptResourceRedactor(params, stageDir).Redact(text)
+}
+
+type promptResourceRedactor struct {
+	aliases []string
+}
+
+func newPromptResourceRedactor(params runtimeacp.PromptParams, stageDir string) promptResourceRedactor {
+	aliases := make([]string, 0, len(params.Prompt)*4+4)
+	seen := map[string]struct{}{}
+	addAlias := func(alias string) {
+		if alias == "" || alias == "." || alias == string(filepath.Separator) {
+			return
+		}
+		if _, exists := seen[alias]; exists {
+			return
+		}
+		seen[alias] = struct{}{}
+		aliases = append(aliases, alias)
+	}
+	addPath := func(localPath string) {
+		if localPath == "" {
+			return
+		}
+		paths := []string{localPath}
+		if resolved, err := filepath.EvalSymlinks(localPath); err == nil {
+			paths = append(paths, resolved)
+		}
+		for _, candidate := range paths {
+			addAlias(candidate)
+			addAlias(fileURIFromPath(candidate))
+			addAlias(filepath.Base(candidate))
+		}
 	}
 	for _, block := range params.Prompt {
 		if block.PreparedFile == nil || block.PreparedFile.Path == "" {
 			continue
 		}
-		text = scrubPromptResourcePath(text, block.PreparedFile.Path)
+		addPath(block.PreparedFile.Path)
 	}
-	return scrubPromptResourcePath(text, stageDir)
+	addPath(stageDir)
+	sort.SliceStable(aliases, func(left, right int) bool {
+		return len(aliases[left]) > len(aliases[right])
+	})
+	return promptResourceRedactor{aliases: aliases}
 }
 
-func scrubPromptResourcePath(text, localPath string) string {
-	aliases := []string{localPath}
-	if resolved, err := filepath.EvalSymlinks(localPath); err == nil && resolved != localPath {
-		aliases = append(aliases, resolved)
-	}
-	for _, alias := range aliases {
-		text = strings.ReplaceAll(text, fileURIFromPath(alias), "[prompt-resource]")
+func (r promptResourceRedactor) Redact(text string) string {
+	for _, alias := range r.aliases {
 		text = strings.ReplaceAll(text, alias, "[prompt-resource]")
 	}
 	return text
 }
 
+type promptResourceStreamRedactor struct {
+	redactor promptResourceRedactor
+	pending  string
+}
+
+func (r promptResourceRedactor) Stream() *promptResourceStreamRedactor {
+	return &promptResourceStreamRedactor{redactor: r}
+}
+
+func (r *promptResourceStreamRedactor) Push(text string) string {
+	if r == nil {
+		return text
+	}
+	r.pending += text
+	if len(r.redactor.aliases) == 0 {
+		out := r.pending
+		r.pending = ""
+		return out
+	}
+	maxAliasBytes := len(r.redactor.aliases[0])
+	if len(r.pending) < maxAliasBytes {
+		return ""
+	}
+	cut := len(r.pending) - maxAliasBytes + 1
+	for cut > 0 && cut < len(r.pending) && !utf8.RuneStart(r.pending[cut]) {
+		cut--
+	}
+	for {
+		changed := false
+		for _, alias := range r.redactor.aliases {
+			searchFrom := cut - len(alias) + 1
+			if searchFrom < 0 {
+				searchFrom = 0
+			}
+			for {
+				index := strings.Index(r.pending[searchFrom:], alias)
+				if index < 0 {
+					break
+				}
+				index += searchFrom
+				if index >= cut {
+					break
+				}
+				if index+len(alias) > cut {
+					cut = index
+					changed = true
+					break
+				}
+				searchFrom = index + 1
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	out := r.redactor.Redact(r.pending[:cut])
+	r.pending = r.pending[cut:]
+	return out
+}
+
+func (r *promptResourceStreamRedactor) Flush() string {
+	if r == nil {
+		return ""
+	}
+	out := r.redactor.Redact(r.pending)
+	r.pending = ""
+	return out
+}
+
+func (r *promptResourceStreamRedactor) Discard() {
+	if r != nil {
+		r.pending = ""
+	}
+}
+
 type promptResourceCandidate struct {
-	blockIndex int
-	name       string
-	sourcePath string
-	sourceInfo os.FileInfo
-	base64Data string
+	blockIndex  int
+	name        string
+	originalURI string
+	sourcePath  string
+	sourceInfo  os.FileInfo
+	base64Data  string
 }
 
 type promptResourceStage struct {
@@ -362,10 +498,22 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			if err := validateBinaryMediaType(block.Type, block.MimeType); err != nil {
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: %w", index, err)
 			}
+			if block.Type == "audio" && block.URI != "" {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: audio URI metadata is unsupported", index)
+			}
+			originalURI, err := safePreparedOriginalURI(block.URI)
+			if err != nil {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid image URI metadata: %w", index, err)
+			}
+			fallbackName := block.Type + extensionForMediaType(block.MimeType)
+			if block.Type == "image" && block.URI != "" {
+				fallbackName = resourceDisplayName(block.URI, fallbackName)
+			}
 			candidates = append(candidates, promptResourceCandidate{
-				blockIndex: index,
-				name:       firstNonEmpty(strings.TrimSpace(block.Name), block.Type+extensionForMediaType(block.MimeType)),
-				base64Data: block.Data,
+				blockIndex:  index,
+				name:        firstNonEmpty(block.Name, fallbackName),
+				originalURI: originalURI,
+				base64Data:  block.Data,
 			})
 		case "resource":
 			if block.Resource == nil {
@@ -378,10 +526,15 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: embedded resource cannot contain text and blob", index)
 			}
 			if block.Resource.Blob != "" {
+				originalURI, err := safePreparedOriginalURI(block.Resource.URI)
+				if err != nil {
+					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
+				}
 				candidates = append(candidates, promptResourceCandidate{
-					blockIndex: index,
-					name:       firstNonEmpty(block.Name, resourceDisplayName(block.Resource.URI, "resource"+extensionForMediaType(block.Resource.MimeType))),
-					base64Data: block.Resource.Blob,
+					blockIndex:  index,
+					name:        firstNonEmpty(block.Name, resourceDisplayName(block.Resource.URI, "resource"+extensionForMediaType(block.Resource.MimeType))),
+					originalURI: originalURI,
+					base64Data:  block.Resource.Blob,
 				})
 			}
 		case "resource_link":
@@ -443,8 +596,8 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		}
 		return runtimeacp.PromptParams{}, nil, cause
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fail(errors.New("secure private prompt resource directory"))
+	if err := securePromptResourceStage(dir); err != nil {
+		return fail(fmt.Errorf("secure private prompt resource directory: %w", scrubPathError(err)))
 	}
 
 	var totalBytes int64
@@ -499,11 +652,14 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		totalBytes += written
 		stagedURI := fileURIFromPath(destination)
 		block := out.Prompt[candidate.blockIndex]
-		block.PreparedFile = &runtimeacp.PreparedFile{Path: destination, SizeBytes: written}
+		block.PreparedFile = &runtimeacp.PreparedFile{Path: destination, SizeBytes: written, OriginalURI: candidate.originalURI}
 		switch block.Type {
 		case "image", "audio":
 			block.Data = ""
 			block.URI = stagedURI
+			if strings.TrimSpace(block.Name) == "" {
+				block.Name = candidate.name
+			}
 		case "resource":
 			resource := *block.Resource
 			resource.Blob = ""
@@ -523,6 +679,24 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		return fail(errors.New("seal private prompt resource directory"))
 	}
 	return out, stage, nil
+}
+
+func safePreparedOriginalURI(rawURI string) (string, error) {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return "", nil
+	}
+	if err := validateAbsoluteURI(rawURI); err != nil {
+		return "", err
+	}
+	_, local, err := localResourcePath(rawURI)
+	if err != nil {
+		return "", err
+	}
+	if local {
+		return "", nil
+	}
+	return rawURI, nil
 }
 
 func normalizedPromptResourceLimits(limits PromptResourceLimits) PromptResourceLimits {
@@ -549,6 +723,9 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 			_ = file.Close()
 		}
 	}()
+	if err := verifyPrivatePromptResourceFile(file); err != nil {
+		return 0, errors.New("verify staged resource permissions")
+	}
 
 	buffer := make([]byte, 32*1024)
 	var written int64

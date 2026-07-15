@@ -1,6 +1,7 @@
 package commandbridge
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -518,6 +519,11 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 			}
 		}()
 	}
+	stageDir := ""
+	if stage != nil {
+		stageDir = stage.dir
+	}
+	promptRedactor := newPromptResourceRedactor(preparedParams, stageDir)
 	promptParams := b.promptParamsForSession(state, preparedParams)
 	promptSession := state.Session
 	if stage != nil {
@@ -528,31 +534,39 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 	}
 	command, err := b.spec.BuildPrompt(promptSession, promptParams)
 	if err != nil {
-		return nil, invalidParams("build prompt command", err.Error())
+		return nil, invalidParams("build prompt command", promptRedactor.Redact(err.Error()))
 	}
 	parser := b.newStreamParser(state.Session, promptParams)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
-	result, assistantText, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command, parser)
+	result, assistantText, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command, parser, promptRedactor)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 	}
 	if err != nil {
 		if b.authRequired(result, err) {
-			return nil, authRequired(commandErrorData(result, err))
+			return nil, authRequired(commandErrorData(
+				redactPromptCommandResult(result, promptRedactor.Redact),
+				redactPromptCommandError(err, promptRedactor.Redact),
+			))
 		}
-		data := commandErrorData(result, err)
+		data := commandErrorData(
+			redactPromptCommandResult(result, promptRedactor.Redact),
+			redactPromptCommandError(err, promptRedactor.Redact),
+		)
 		if kind := b.classifyPromptFailure(state.Session, command, result, err); kind != "" {
 			data["errorKind"] = kind
 		}
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
-	b.recordPromptSuccess(req.SessionID)
-	assistantTranscriptText := sanitizeTranscriptAssistantText(req, assistantText)
+	assistantTranscriptText := promptRedactor.Redact(assistantText)
 	if stage != nil {
-		assistantTranscriptText = scrubPromptResourcePaths(assistantTranscriptText, preparedParams, stage.dir)
+		if cleanupErr := stage.cleanup(); cleanupErr != nil {
+			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource cleanup failed", Data: cleanupErr.Error()}
+		}
 	}
+	b.recordPromptSuccess(req.SessionID)
 	if info, ok := b.recordTranscriptExchange(req.SessionID, promptTranscriptText(req), assistantTranscriptText); ok {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
@@ -567,17 +581,21 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 	return runtimeacp.PromptResult{StopReason: stopReason}, nil
 }
 
-func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec, parser StreamParser) (adapterprocess.Result, string, error) {
+func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec, parser StreamParser, redactor promptResourceRedactor) (adapterprocess.Result, string, error) {
 	if err := runCtx.Err(); err != nil {
 		return adapterprocess.Result{}, "", err
 	}
+	redact := redactor.Redact
+	notificationCommand := command
+	notificationCommand.Command = redact(notificationCommand.Command)
+	notificationCommand.Dir = redact(notificationCommand.Dir)
 	toolCallID := b.newToolCallID()
-	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, command); err != nil {
+	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, notificationCommand); err != nil {
 		return adapterprocess.Result{}, "", fmt.Errorf("notify prompt tool start: %w", err)
 	}
 	if contextErr := runCtx.Err(); contextErr != nil {
 		result := promptCommandResultForFinish(adapterprocess.Result{}, contextErr)
-		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, contextErr, contextErr); notifyErr != nil {
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, result, contextErr, contextErr); notifyErr != nil {
 			return adapterprocess.Result{}, "", fmt.Errorf("notify cancelled prompt tool finish: %w", notifyErr)
 		}
 		return adapterprocess.Result{}, "", contextErr
@@ -585,29 +603,57 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 
 	if runner, ok := b.spec.Runner.(StreamRunner); ok {
 		var assistantText strings.Builder
+		streamRedactor := redactor.Stream()
 		result, err := runner.RunStream(runCtx, command, func(chunk []byte) error {
 			if contextErr := runCtx.Err(); contextErr != nil {
 				return contextErr
 			}
 			if parser == nil {
 				assistantText.Write(chunk)
-				return notifyAgentMessageChunk(methodCtx, sessionID, string(chunk))
+				if contextErr := runCtx.Err(); contextErr != nil {
+					return contextErr
+				}
+				text := streamRedactor.Push(string(chunk))
+				if text == "" {
+					return nil
+				}
+				if contextErr := runCtx.Err(); contextErr != nil {
+					return contextErr
+				}
+				return notifyAgentMessageChunk(methodCtx, sessionID, text)
 			}
 			events, parseErr := parser.Parse(chunk)
 			if parseErr != nil {
 				return parseErr
 			}
-			return handleStreamEvents(methodCtx, sessionID, events)
+			return handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redact))
 		})
-		if parser != nil {
+		if parser == nil {
+			if runCtx.Err() == nil && err == nil {
+				if text := streamRedactor.Flush(); text != "" {
+					if contextErr := runCtx.Err(); contextErr != nil {
+						err = contextErr
+					} else if notifyErr := notifyAgentMessageChunk(methodCtx, sessionID, text); notifyErr != nil {
+						err = fmt.Errorf("notification failed: %w", notifyErr)
+					}
+				}
+			} else {
+				streamRedactor.Discard()
+			}
+		}
+		if parser != nil && runCtx.Err() == nil {
 			events, flushErr := parser.Flush()
-			if flushErr != nil && err == nil {
-				err = flushErr
+			if runCtx.Err() == nil {
+				if flushErr != nil && err == nil {
+					err = flushErr
+				}
+				if notifyErr := handleStreamEvents(runCtx, methodCtx, sessionID, redactPromptStreamEvents(events, redact)); notifyErr != nil && err == nil {
+					err = notifyErr
+				}
+				if runCtx.Err() == nil {
+					assistantText.WriteString(parser.Transcript())
+				}
 			}
-			if notifyErr := handleStreamEvents(methodCtx, sessionID, events); notifyErr != nil && err == nil {
-				err = notifyErr
-			}
-			assistantText.WriteString(parser.Transcript())
 		}
 		finishResult := result
 		if parser != nil {
@@ -615,20 +661,26 @@ func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodC
 			finishResult.StdoutTruncated = false
 		}
 		finishResult = promptCommandResultForFinish(finishResult, runCtx.Err())
-		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, finishResult, err, runCtx.Err()); notifyErr != nil && err == nil {
+		finishResult = redactPromptCommandResult(finishResult, redact)
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redact), runCtx.Err()); notifyErr != nil && err == nil {
 			err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 		}
 		return result, assistantText.String(), err
 	}
 	result, err := b.spec.Runner.Run(runCtx, command)
-	text := strings.TrimSpace(string(result.Stdout))
-	if text != "" {
-		if notifyErr := notifyAgentMessageChunk(methodCtx, sessionID, text); notifyErr != nil && err == nil {
+	contextErr := runCtx.Err()
+	text := strings.TrimSpace(redact(string(result.Stdout)))
+	if contextErr == nil && text != "" {
+		if contextErr = runCtx.Err(); contextErr != nil {
+			text = ""
+		} else if notifyErr := notifyAgentMessageChunk(methodCtx, sessionID, text); notifyErr != nil && err == nil {
 			err = fmt.Errorf("notification failed: %w", notifyErr)
 		}
 	}
-	finishResult := promptCommandResultForFinish(result, runCtx.Err())
-	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, finishResult, err, runCtx.Err()); notifyErr != nil && err == nil {
+	contextErr = runCtx.Err()
+	finishResult := promptCommandResultForFinish(result, contextErr)
+	finishResult = redactPromptCommandResult(finishResult, redact)
+	if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, notificationCommand, finishResult, redactPromptCommandError(err, redact), contextErr); notifyErr != nil && err == nil {
 		err = fmt.Errorf("notify prompt tool finish: %w", notifyErr)
 	}
 	return result, string(result.Stdout), err
@@ -645,6 +697,116 @@ func promptCommandResultForFinish(result adapterprocess.Result, contextErr error
 	return result
 }
 
+func redactPromptCommandResult(result adapterprocess.Result, redact func(string) string) adapterprocess.Result {
+	if redact == nil {
+		return result
+	}
+	if result.Stdout != nil {
+		result.Stdout = []byte(redact(string(result.Stdout)))
+	}
+	if result.Stderr != nil {
+		result.Stderr = []byte(redact(string(result.Stderr)))
+	}
+	return result
+}
+
+func redactPromptCommandError(err error, redact func(string) string) error {
+	if err == nil || redact == nil {
+		return err
+	}
+	return errors.New(redact(err.Error()))
+}
+
+func redactPromptStreamEvents(events []StreamEvent, redact func(string) string) []StreamEvent {
+	if len(events) == 0 || redact == nil {
+		return events
+	}
+	out := make([]StreamEvent, len(events))
+	for index, event := range events {
+		out[index] = event
+		if event.Update != nil {
+			out[index].Update = redactPromptStringValues(event.Update, redact).(map[string]any)
+		}
+		if event.PermissionRequest != nil {
+			request := *event.PermissionRequest
+			request.ToolCallID = redact(request.ToolCallID)
+			request.Title = redact(request.Title)
+			request.Kind = redact(request.Kind)
+			request.RawInput = redactPromptStringValues(request.RawInput, redact)
+			request.Options = append([]PermissionOption(nil), request.Options...)
+			for optionIndex := range request.Options {
+				request.Options[optionIndex].OptionID = redact(request.Options[optionIndex].OptionID)
+				request.Options[optionIndex].Name = redact(request.Options[optionIndex].Name)
+				request.Options[optionIndex].Kind = redact(request.Options[optionIndex].Kind)
+			}
+			out[index].PermissionRequest = &request
+		}
+	}
+	return out
+}
+
+func redactPromptStringValues(value any, redact func(string) string) any {
+	switch typed := value.(type) {
+	case string:
+		return redact(typed)
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[redact(key)] = redactPromptStringValues(item, redact)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			out[redact(key)] = redact(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for index, item := range typed {
+			out[index] = redactPromptStringValues(item, redact)
+		}
+		return out
+	case []string:
+		out := make([]string, len(typed))
+		for index, item := range typed {
+			out[index] = redact(item)
+		}
+		return out
+	case json.RawMessage:
+		var decoded any
+		decoder := json.NewDecoder(bytes.NewReader(typed))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			return json.RawMessage(redact(string(typed)))
+		}
+		redacted, err := json.Marshal(redactPromptStringValues(decoded, redact))
+		if err != nil {
+			return json.RawMessage(redact(string(typed)))
+		}
+		return json.RawMessage(redacted)
+	case []byte:
+		return []byte(redact(string(typed)))
+	case nil, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number:
+		return value
+	default:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return value
+		}
+		var decoded any
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			return value
+		}
+		return redactPromptStringValues(decoded, redact)
+	}
+}
+
 func (b *Bridge) newStreamParser(session Session, params runtimeacp.PromptParams) StreamParser {
 	if b.spec.NewStreamParser == nil {
 		return nil
@@ -653,23 +815,17 @@ func (b *Bridge) newStreamParser(session Session, params runtimeacp.PromptParams
 }
 
 func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.PromptParams) runtimeacp.PromptParams {
-	if !b.spec.IncludeTranscript {
+	if !b.spec.IncludeTranscript || len(state.transcript) == 0 {
 		return req
 	}
-	userText := promptTranscriptText(req)
-	if userText == "" || len(state.transcript) == 0 {
+	history := transcriptHistoryPrelude(state.transcript)
+	if history == "" {
 		return req
 	}
-	text := transcriptPrompt(state.transcript, userText)
 	out := req
 	out.Prompt = make([]runtimeacp.ContentBlock, 0, len(req.Prompt)+1)
-	out.Prompt = append(out.Prompt, runtimeacp.ContentBlock{Type: "text", Text: text})
-	for _, block := range req.Prompt {
-		if block.Type == "text" {
-			continue
-		}
-		out.Prompt = append(out.Prompt, block)
-	}
+	out.Prompt = append(out.Prompt, runtimeacp.ContentBlock{Type: "text", Text: history})
+	out.Prompt = append(out.Prompt, req.Prompt...)
 	return out
 }
 
@@ -727,7 +883,7 @@ func (b *Bridge) maxTranscriptExchanges() int {
 	return defaultMaxTranscriptExchanges
 }
 
-func transcriptPrompt(history []transcriptExchange, current string) string {
+func transcriptHistoryPrelude(history []transcriptExchange) string {
 	var builder strings.Builder
 	builder.WriteString("Previous conversation:\n")
 	for _, exchange := range history {
@@ -742,8 +898,7 @@ func transcriptPrompt(history []transcriptExchange, current string) string {
 			builder.WriteString("\n")
 		}
 	}
-	builder.WriteString("\nCurrent user request:\n")
-	builder.WriteString(strings.TrimSpace(current))
+	builder.WriteString("\nCurrent user request:")
 	return strings.TrimSpace(builder.String())
 }
 
@@ -799,8 +954,11 @@ func notifyAgentMessageChunk(ctx *acp.MethodContext, sessionID string, text stri
 	})
 }
 
-func handleStreamEvents(ctx *acp.MethodContext, sessionID string, events []StreamEvent) error {
+func handleStreamEvents(runCtx context.Context, ctx *acp.MethodContext, sessionID string, events []StreamEvent) error {
 	for _, event := range events {
+		if err := runCtx.Err(); err != nil {
+			return err
+		}
 		if len(event.Update) > 0 {
 			if err := ctx.Notify("session/update", map[string]any{
 				"sessionId": sessionID,
@@ -810,6 +968,9 @@ func handleStreamEvents(ctx *acp.MethodContext, sessionID string, events []Strea
 			}
 		}
 		if event.PermissionRequest != nil {
+			if err := runCtx.Err(); err != nil {
+				return err
+			}
 			if err := requestStreamPermission(ctx, sessionID, *event.PermissionRequest); err != nil {
 				return err
 			}
