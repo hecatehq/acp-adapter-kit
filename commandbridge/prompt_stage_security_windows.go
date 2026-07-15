@@ -522,6 +522,14 @@ func windowsPromptResourceNameKey(name string) string {
 	return strings.ToLower(name)
 }
 
+func alignedWindowsPromptResourceDirectoryBuffer(size int) []byte {
+	const alignment = uintptr(8)
+	storage := make([]byte, size+int(alignment)-1)
+	base := uintptr(unsafe.Pointer(&storage[0]))
+	offset := int((alignment - base%alignment) % alignment)
+	return storage[offset : offset+size]
+}
+
 func listWindowsPromptResourceStageEntries(stage windows.Handle, expectedFiles int) ([]string, error) {
 	if stage == windows.InvalidHandle {
 		return nil, errors.New("prompt resource stage handle is unavailable")
@@ -529,7 +537,10 @@ func listWindowsPromptResourceStageEntries(stage windows.Handle, expectedFiles i
 	if expectedFiles < 0 {
 		return nil, errors.New("invalid expected prompt resource file count")
 	}
-	buffer := make([]byte, 64*1024)
+	// FILE_FULL_DIR_INFO requires a LONGLONG-aligned output buffer. A byte
+	// slice's backing storage has no alignment guarantee, and Windows reports
+	// an unaligned buffer as ERROR_NOACCESS rather than a descriptive error.
+	buffer := alignedWindowsPromptResourceDirectoryBuffer(64 * 1024)
 	class := uint32(windows.FileFullDirectoryRestartInfo)
 	var names []string
 	for {
