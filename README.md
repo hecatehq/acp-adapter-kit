@@ -115,8 +115,9 @@ handles deny delete sharing, and validation rejects untrusted grants of direct
 delete, delete-child, DACL/owner mutation, or full-control rights. Preparation
 atomically creates each private directory with a protected, inheritable DACL
 containing only the current process user and SYSTEM; the kit reads the directory
-DACL back, verifies every new child's inherited DACL before writing bytes, and
-fails closed when the filesystem cannot enforce either. Other platforms reject
+DACL back, creates each empty child with an explicit current-user owner and
+protected user-plus-SYSTEM DACL, verifies it before writing bytes, and fails
+closed when the filesystem cannot enforce either. Other platforms reject
 rich file preparation rather than relying on weaker filesystem semantics.
 
 The cloned `Session` passed to `BuildPrompt` contains the stage as one

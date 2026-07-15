@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
@@ -40,13 +41,18 @@ func TestSecurePromptResourceStageUsesProtectedInheritablePrivateDACL(t *testing
 	assertPromptStageACLEntries(t, descriptor, allowed, true)
 
 	child := filepath.Join(dir, "input.bin")
-	childFile, err := os.OpenFile(child, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	childFile, err := createPrivatePromptResourceFile(child)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPrivatePromptResourceFile(childFile); err != nil {
+	if err := os.Rename(child, child+".moved"); err == nil {
+		_ = os.Rename(child+".moved", child)
 		_ = childFile.Close()
-		t.Fatalf("verify inherited child DACL before write: %v", err)
+		t.Fatal("new private child allowed rename before its retained identity handle was installed")
+	}
+	if err := securePrivatePromptResourceFile(childFile, 0o600); err != nil {
+		_ = childFile.Close()
+		t.Fatalf("verify explicit protected child DACL before write: %v", err)
 	}
 	if _, err := childFile.Write([]byte("private")); err != nil {
 		_ = childFile.Close()
@@ -60,6 +66,68 @@ func TestSecurePromptResourceStageUsesProtectedInheritablePrivateDACL(t *testing
 		t.Fatal(err)
 	}
 	assertPromptStageACLEntries(t, childDescriptor, allowed, false)
+}
+
+func TestWindowsPromptResourceDirectoryInfoLayoutAndBounds(t *testing.T) {
+	if got := unsafe.Offsetof(windowsFileFullDirectoryInfo{}.FileNameLength); got != 60 {
+		t.Fatalf("FileNameLength offset = %d, want 60", got)
+	}
+	if got := unsafe.Offsetof(windowsFileFullDirectoryInfo{}.EaSize); got != 64 {
+		t.Fatalf("EaSize offset = %d, want 64", got)
+	}
+	if got := unsafe.Offsetof(windowsFileFullDirectoryInfo{}.FileName); got != 68 {
+		t.Fatalf("FileName offset = %d, want 68", got)
+	}
+	if got := unsafe.Sizeof(windowsFileFullDirectoryInfo{}); got != 72 {
+		t.Fatalf("FILE_FULL_DIR_INFO size = %d, want 72", got)
+	}
+
+	valid := windowsPromptResourceDirectoryTestBuffer("notes-λ.txt", 0, 0)
+	names, err := decodeWindowsPromptResourceDirectoryEntries(valid, 1)
+	if err != nil || len(names) != 1 || names[0] != "notes-λ.txt" {
+		t.Fatalf("decode valid Unicode entry = %#v, %v", names, err)
+	}
+	if _, err := decodeWindowsPromptResourceDirectoryEntries(valid, 0); err == nil {
+		t.Fatal("entry beyond expected bound was accepted")
+	}
+	dot := windowsPromptResourceDirectoryTestBuffer(".", 0, 0)
+	if names, err := decodeWindowsPromptResourceDirectoryEntries(dot, 0); err != nil || len(names) != 0 {
+		t.Fatalf("decode dot entry = %#v, %v", names, err)
+	}
+
+	oversized := windowsPromptResourceDirectoryTestBuffer("x", 0, 0)
+	(*windowsFileFullDirectoryInfo)(unsafe.Pointer(&oversized[0])).FileNameLength = 0x7ffffffe
+	if _, err := decodeWindowsPromptResourceDirectoryEntries(oversized, 1); err == nil {
+		t.Fatal("oversized name length was accepted")
+	}
+	odd := windowsPromptResourceDirectoryTestBuffer("x", 0, 0)
+	(*windowsFileFullDirectoryInfo)(unsafe.Pointer(&odd[0])).FileNameLength = 3
+	if _, err := decodeWindowsPromptResourceDirectoryEntries(odd, 1); err == nil {
+		t.Fatal("odd name length was accepted")
+	}
+	overlap := windowsPromptResourceDirectoryTestBuffer("x", 68, 80)
+	if _, err := decodeWindowsPromptResourceDirectoryEntries(overlap, 1); err == nil {
+		t.Fatal("overlapping next-entry offset was accepted")
+	}
+	misaligned := windowsPromptResourceDirectoryTestBuffer("x", 76, 80)
+	if _, err := decodeWindowsPromptResourceDirectoryEntries(misaligned, 1); err == nil {
+		t.Fatal("misaligned next-entry offset was accepted")
+	}
+}
+
+func windowsPromptResourceDirectoryTestBuffer(name string, next uint32, minimumSize int) []byte {
+	units := utf16.Encode([]rune(name))
+	header := int(unsafe.Offsetof(windowsFileFullDirectoryInfo{}.FileName))
+	size := header + len(units)*2
+	if size < minimumSize {
+		size = minimumSize
+	}
+	buffer := make([]byte, size)
+	entry := (*windowsFileFullDirectoryInfo)(unsafe.Pointer(&buffer[0]))
+	entry.NextEntryOffset = next
+	entry.FileNameLength = uint32(len(units) * 2)
+	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[header])), len(units)), units)
+	return buffer
 }
 
 func TestPrivateWindowsPromptResourceDescriptorDeduplicatesLocalSystem(t *testing.T) {
@@ -79,6 +147,9 @@ func TestPrivateWindowsPromptResourceDescriptorDeduplicatesLocalSystem(t *testin
 		t.Fatalf("descriptor owner = %v, want LocalSystem", owner)
 	}
 	assertPromptStageACLEntries(t, descriptor, []*windows.SID{system}, true)
+	if _, err := privateWindowsPromptResourceSecurityDescriptorFor([]*windows.SID{nil}); err == nil {
+		t.Fatal("nil owner principal was accepted")
+	}
 }
 
 func TestWindowsPromptResourceDirectoriesArePrivateAtCreation(t *testing.T) {
@@ -554,11 +625,12 @@ func assertPromptStageACLEntries(t *testing.T, descriptor *windows.SECURITY_DESC
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || !isFullPromptResourceAccess(ace.Mask) {
 			t.Fatalf("ACE %d type/mask = %d/%#x, want allow/full control", index, ace.Header.AceType, ace.Mask)
 		}
+		wantFlags := uint8(0)
 		if requireInheritance {
-			want := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
-			if ace.Header.AceFlags&want != want {
-				t.Fatalf("ACE %d flags = %#x, want object+container inheritance", index, ace.Header.AceFlags)
-			}
+			wantFlags = uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+		}
+		if ace.Header.AceFlags != wantFlags {
+			t.Fatalf("ACE %d flags = %#x, want exactly %#x", index, ace.Header.AceFlags, wantFlags)
 		}
 		entrySID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		for allowedIndex, sid := range allowed {

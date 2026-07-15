@@ -980,7 +980,7 @@ func normalizedPromptResourceLimits(limits PromptResourceLimits) PromptResourceL
 }
 
 func writePrivatePromptResource(ctx context.Context, destination string, reader io.Reader, maxBytes int64, protect func(string) error) (int64, error) {
-	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := createPrivatePromptResourceFile(destination)
 	if err != nil {
 		return 0, promptResourceStagingFailure("create staged prompt resource", err)
 	}

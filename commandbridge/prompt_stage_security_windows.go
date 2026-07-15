@@ -52,7 +52,7 @@ const (
 		windows.FILE_LIST_DIRECTORY | windows.FILE_TRAVERSE
 )
 
-type windowsFileIDBothDirectoryInfo struct {
+type windowsFileFullDirectoryInfo struct {
 	NextEntryOffset uint32
 	FileIndex       uint32
 	CreationTime    int64
@@ -64,9 +64,6 @@ type windowsFileIDBothDirectoryInfo struct {
 	FileAttributes  uint32
 	FileNameLength  uint32
 	EaSize          uint32
-	ShortNameLength uint32
-	ShortName       [12]uint16
-	FileID          int64
 	FileName        [1]uint16
 }
 
@@ -250,21 +247,86 @@ func privateWindowsPromptResourceSecurityDescriptor() (*windows.SECURITY_DESCRIP
 }
 
 func privateWindowsPromptResourceSecurityDescriptorFor(allowed []*windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
-	if len(allowed) == 0 {
+	return privateWindowsPromptResourceSecurityDescriptorWithFlags(allowed, "OICI")
+}
+
+func privateWindowsPromptResourceFileSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
+	allowed, err := promptStageAllowedSIDs()
+	if err != nil {
+		return nil, err
+	}
+	return privateWindowsPromptResourceSecurityDescriptorWithFlags(allowed, "")
+}
+
+func privateWindowsPromptResourceSecurityDescriptorWithFlags(allowed []*windows.SID, inheritance string) (*windows.SECURITY_DESCRIPTOR, error) {
+	if len(allowed) == 0 || allowed[0] == nil {
 		return nil, errors.New("prompt resource owner is unavailable")
+	}
+	if inheritance != "" && inheritance != "OICI" {
+		return nil, errors.New("unsupported prompt resource ACL inheritance")
+	}
+	for _, sid := range allowed {
+		if sid == nil {
+			return nil, errors.New("prompt resource principal is unavailable")
+		}
 	}
 	var sddl strings.Builder
 	sddl.WriteString("O:")
 	sddl.WriteString(allowed[0].String())
 	sddl.WriteString("D:P")
 	for _, sid := range allowed {
-		sddl.WriteString("(A;OICI;0x")
+		sddl.WriteString("(A;")
+		sddl.WriteString(inheritance)
+		sddl.WriteString(";0x")
 		sddl.WriteString(strconv.FormatUint(uint64(uint32(windowsPromptResourceFullAccess)), 16))
 		sddl.WriteString(";;;")
 		sddl.WriteString(sid.String())
 		sddl.WriteByte(')')
 	}
 	return windows.SecurityDescriptorFromString(sddl.String())
+}
+
+func createPrivatePromptResourceFile(path string) (*os.File, error) {
+	descriptor, err := privateWindowsPromptResourceFileSecurityDescriptor()
+	if err != nil {
+		return nil, err
+	}
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	attributes := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	handle, err := windows.CreateFile(
+		path16,
+		windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL,
+		windowsPromptResourceShareNoDelete,
+		&attributes,
+		windows.CREATE_NEW,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	runtime.KeepAlive(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		_ = windows.CloseHandle(handle)
+		return nil, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("staged resource must be a non-reparse file")
+	}
+	file := os.NewFile(uintptr(handle), path)
+	if file == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("wrap staged resource handle")
+	}
+	return file, nil
 }
 
 func createPrivateWindowsPromptResourceDirectory(parent, prefix string, descriptor *windows.SECURITY_DESCRIPTOR) (string, error) {
@@ -468,14 +530,14 @@ func listWindowsPromptResourceStageEntries(stage windows.Handle, expectedFiles i
 		return nil, errors.New("invalid expected prompt resource file count")
 	}
 	buffer := make([]byte, 64*1024)
-	class := uint32(windows.FileIdBothDirectoryRestartInfo)
+	class := uint32(windows.FileFullDirectoryRestartInfo)
 	var names []string
 	for {
 		err := windows.GetFileInformationByHandleEx(stage, class, &buffer[0], uint32(len(buffer)))
 		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
 			return names, nil
 		}
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && class == windows.FileIdBothDirectoryRestartInfo && len(names) == 0 {
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && class == windows.FileFullDirectoryRestartInfo && len(names) == 0 {
 			// Some filesystem drivers report an empty directory this way for the
 			// restart information class. The retained handle was already validated
 			// above, so this cannot be confused with a missing stage path.
@@ -484,7 +546,7 @@ func listWindowsPromptResourceStageEntries(stage windows.Handle, expectedFiles i
 		if err != nil {
 			return nil, err
 		}
-		class = windows.FileIdBothDirectoryInfo
+		class = windows.FileFullDirectoryInfo
 		batch, err := decodeWindowsPromptResourceDirectoryEntries(buffer, expectedFiles-len(names))
 		if err != nil {
 			return nil, err
@@ -500,40 +562,39 @@ func decodeWindowsPromptResourceDirectoryEntries(buffer []byte, remainingExpecte
 	if remainingExpected < 0 {
 		return nil, errors.New("prompt resource stage contains unexpected entries")
 	}
-	// Decode at most one entry beyond the expected count so an attacker cannot
-	// turn directory verification into unbounded work while extras still fail
-	// closed.
-	maxPromptResourceDirectoryEntries := remainingExpected + 1
-	entryHeaderBytes := int(unsafe.Offsetof(windowsFileIDBothDirectoryInfo{}.FileName))
+	entryHeaderBytes := int(unsafe.Offsetof(windowsFileFullDirectoryInfo{}.FileName))
 	var names []string
 	for offset := 0; ; {
-		if offset < 0 || offset+entryHeaderBytes > len(buffer) {
+		if offset < 0 || offset > len(buffer) || entryHeaderBytes > len(buffer)-offset {
 			return nil, errors.New("malformed Windows prompt resource directory listing")
 		}
-		entry := (*windowsFileIDBothDirectoryInfo)(unsafe.Pointer(&buffer[offset]))
-		nameBytes := int(entry.FileNameLength)
-		if nameBytes < 0 || nameBytes%2 != 0 || offset+entryHeaderBytes+nameBytes > len(buffer) {
+		entry := (*windowsFileFullDirectoryInfo)(unsafe.Pointer(&buffer[offset]))
+		nameBytes64 := uint64(entry.FileNameLength)
+		availableNameBytes := len(buffer) - offset - entryHeaderBytes
+		if nameBytes64 == 0 || nameBytes64%2 != 0 || nameBytes64 > uint64(availableNameBytes) {
 			return nil, errors.New("malformed Windows prompt resource entry name")
 		}
+		nameBytes := int(nameBytes64)
 		nameUnits := unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[offset+entryHeaderBytes])), nameBytes/2)
 		name := string(utf16.Decode(nameUnits))
 		if name != "." && name != ".." {
 			if name == "" || strings.ContainsAny(name, `/\`) {
 				return nil, errors.New("prompt resource stage contains an invalid entry name")
 			}
-			names = append(names, name)
-			if len(names) > maxPromptResourceDirectoryEntries {
+			if len(names) >= remainingExpected {
 				return nil, errors.New("prompt resource stage contains unexpected entries")
 			}
+			names = append(names, name)
 		}
 		if entry.NextEntryOffset == 0 {
 			return names, nil
 		}
-		next := offset + int(entry.NextEntryOffset)
-		if next <= offset || next > len(buffer) {
+		delta := uint64(entry.NextEntryOffset)
+		minimumDelta := uint64(entryHeaderBytes) + nameBytes64
+		if delta < minimumDelta || delta%8 != 0 || delta > uint64(len(buffer)-offset) {
 			return nil, errors.New("malformed Windows prompt resource directory offset")
 		}
-		offset = next
+		offset += int(delta)
 	}
 }
 
@@ -1185,7 +1246,7 @@ func verifyPromptResourceStageACLHandle(handle windows.Handle, allowed []*window
 	if owner == nil || defaulted || !owner.Equals(allowed[0]) {
 		return errors.New("prompt resource owner is not the process user")
 	}
-	return verifyPromptResourceACL(descriptor, allowed, true, uint8(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE), uint8(windows.INHERITED_ACE))
+	return verifyPromptResourceACL(descriptor, allowed, true, uint8(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE))
 }
 
 func verifyPrivatePromptResourceFile(file *os.File) error {
@@ -1214,7 +1275,7 @@ func verifyPrivatePromptResourceFileHandle(handle windows.Handle) error {
 	if owner == nil || defaulted || !owner.Equals(allowed[0]) {
 		return errors.New("staged resource owner is not the process user")
 	}
-	return verifyPromptResourceACL(descriptor, allowed, false, uint8(windows.INHERITED_ACE), 0)
+	return verifyPromptResourceACL(descriptor, allowed, true, 0)
 }
 
 func securePrivatePromptResourceFile(file *os.File, mode os.FileMode) error {
@@ -1227,7 +1288,7 @@ func securePrivatePromptResourceFile(file *os.File, mode os.FileMode) error {
 	return verifyPrivatePromptResourceFile(file)
 }
 
-func verifyPromptResourceACL(descriptor *windows.SECURITY_DESCRIPTOR, allowed []*windows.SID, requireProtected bool, requiredFlags, forbiddenFlags uint8) error {
+func verifyPromptResourceACL(descriptor *windows.SECURITY_DESCRIPTOR, allowed []*windows.SID, requireProtected bool, expectedFlags uint8) error {
 	if descriptor == nil {
 		return errors.New("security descriptor is nil")
 	}
@@ -1257,7 +1318,7 @@ func verifyPromptResourceACL(descriptor *windows.SECURITY_DESCRIPTOR, allowed []
 		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 			return errors.New("DACL contains a non-allow entry")
 		}
-		if ace.Header.AceFlags&requiredFlags != requiredFlags || ace.Header.AceFlags&forbiddenFlags != 0 {
+		if ace.Header.AceFlags != expectedFlags {
 			return errors.New("DACL entry flags do not match the private-stage contract")
 		}
 		if !isFullPromptResourceAccess(ace.Mask) {
