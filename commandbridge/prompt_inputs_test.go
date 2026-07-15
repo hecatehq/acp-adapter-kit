@@ -117,8 +117,15 @@ func TestPreparePromptResourcesMaterializesEveryRichInputInOrder(t *testing.T) {
 		t.Fatalf("RequirePromptText returned error: %v", err)
 	}
 	for _, input := range inputs[1:6] {
-		if input.Path != "" && !strings.Contains(promptText, input.Path) {
-			t.Fatalf("prompt text does not contain exact staged path %q:\n%s", input.Path, promptText)
+		if input.Path == "" {
+			continue
+		}
+		encodedPath, marshalErr := json.Marshal(input.Path)
+		if marshalErr != nil {
+			t.Fatalf("encode staged path %q: %v", input.Path, marshalErr)
+		}
+		if !strings.Contains(promptText, string(encodedPath)) {
+			t.Fatalf("prompt text does not contain exact JSON-encoded staged path %q:\n%s", input.Path, promptText)
 		}
 	}
 	if strings.Contains(promptText, sourceDir) {
