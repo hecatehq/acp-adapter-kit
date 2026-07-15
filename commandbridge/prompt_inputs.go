@@ -30,9 +30,12 @@ const (
 	// DefaultMaxPromptResourceTotalBytes bounds all decoded and copied files in
 	// one prompt.
 	DefaultMaxPromptResourceTotalBytes int64 = 12 << 20
+	privateEmbeddedResourceURI               = "urn:acp-adapter-kit:local-resource"
 )
 
 var errPromptResourceSizeLimit = errors.New("resource exceeds prompt size limit")
+
+const promptResourceCleanupAttempts = 2
 
 // PromptResourceLimits bounds private prompt-scoped file preparation. Values
 // less than one use the corresponding conservative default.
@@ -428,7 +431,7 @@ func promptResourcePathDir(localPath, goos string) string {
 		dir := path.Dir(slashPath)
 		return strings.ReplaceAll(dir, "/", `\`)
 	}
-	return filepath.Dir(localPath)
+	return path.Dir(localPath)
 }
 
 func replaceAllPromptResourceAlias(text, alias, replacement string, caseInsensitive bool) string {
@@ -499,9 +502,10 @@ func (r *promptResourceStreamRedactor) Push(text string) string {
 		return ""
 	}
 	cut := len(r.pending) - maxAliasBytes + 1
-	for cut > 0 && cut < len(r.pending) && !utf8.RuneStart(r.pending[cut]) {
-		cut--
-	}
+	// A valid UTF-8 rune has at most UTFMax-1 continuation bytes. Never scan
+	// farther back than that: child-process output is arbitrary bytes, and an
+	// unbounded run of invalid continuation bytes must still make progress.
+	cut = promptResourceUTF8Boundary(r.pending, cut)
 	for {
 		changed := false
 		for _, alias := range r.redactor.aliases {
@@ -535,6 +539,32 @@ func (r *promptResourceStreamRedactor) Push(text string) string {
 	return out
 }
 
+func promptResourceUTF8Boundary(text string, cut int) int {
+	if cut <= 0 || cut >= len(text) || utf8.RuneStart(text[cut]) {
+		return cut
+	}
+	originalCut := cut
+	minimumCut := cut - (utf8.UTFMax - 1)
+	if minimumCut < 0 {
+		minimumCut = 0
+	}
+	for cut > minimumCut && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if !utf8.RuneStart(text[cut]) {
+		return originalCut
+	}
+	candidate := text[cut:]
+	if !utf8.FullRuneInString(candidate) {
+		return cut
+	}
+	_, size := utf8.DecodeRuneInString(candidate)
+	if size > 1 && cut+size > originalCut {
+		return cut
+	}
+	return originalCut
+}
+
 func (r *promptResourceStreamRedactor) Flush() string {
 	if r == nil {
 		return ""
@@ -560,11 +590,13 @@ type promptResourceCandidate struct {
 }
 
 type promptResourceStageGuard interface {
+	SetExpectedFiles(int) error
 	Secure() error
 	ProtectFile(string) error
 	Seal() error
 	Verify() error
 	Cleanup(func(string) error) error
+	Abandon() error
 }
 
 type promptResourceStage struct {
@@ -586,6 +618,23 @@ func (e *promptResourceCleanupError) Unwrap() error {
 	return e.err
 }
 
+type promptResourceStagingError struct {
+	operation string
+	err       error
+}
+
+func (e *promptResourceStagingError) Error() string {
+	return e.operation + " failed"
+}
+
+func (e *promptResourceStagingError) Unwrap() error {
+	return e.err
+}
+
+func promptResourceStagingFailure(operation string, err error) error {
+	return &promptResourceStagingError{operation: operation, err: err}
+}
+
 func (s *promptResourceStage) cleanup() error {
 	if s == nil || s.dir == "" {
 		return nil
@@ -593,13 +642,21 @@ func (s *promptResourceStage) cleanup() error {
 	if s.guard == nil {
 		return &promptResourceCleanupError{err: errors.New("private prompt resource identity protection is unavailable")}
 	}
-	if err := s.guard.Cleanup(s.cleanupHook); err != nil {
-		return &promptResourceCleanupError{err: err}
+	var cleanupErr error
+	for attempt := 0; attempt < promptResourceCleanupAttempts; attempt++ {
+		cleanupErr = s.guard.Cleanup(s.cleanupHook)
+		if cleanupErr == nil {
+			s.dir = ""
+			s.anchor = ""
+			s.guard = nil
+			return nil
+		}
 	}
+	abandonErr := s.guard.Abandon()
 	s.dir = ""
 	s.anchor = ""
 	s.guard = nil
-	return nil
+	return &promptResourceCleanupError{err: errors.Join(cleanupErr, abandonErr)}
 }
 
 func (s *promptResourceStage) verify() error {
@@ -640,6 +697,15 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			if block.Type == "audio" && block.URI != "" {
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: audio URI metadata is unsupported", index)
 			}
+			if len(candidates) >= limits.MaxFiles {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt contains more than %d local file inputs", limits.MaxFiles)
+			}
+			if int64(base64.StdEncoding.DecodedLen(len(block.Data))) > limits.MaxFileBytes+2 {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: decoded resource exceeds per-file limit", index)
+			}
+			if err := validatePromptResourceBase64(block.Data); err != nil {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: %w", index, err)
+			}
 			originalURI, err := safePreparedOriginalURI(block.URI)
 			if err != nil {
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid image URI metadata: %w", index, err)
@@ -665,7 +731,30 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			if err != nil {
 				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: %w", index, err)
 			}
+			if resourceKind == runtimeacp.EmbeddedResourceText {
+				localSensitive, err := sensitiveLocalFileURI(block.Resource.URI)
+				if err != nil {
+					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
+				}
+				if localSensitive {
+					resource := *block.Resource
+					resource.URI = privateEmbeddedResourceURI
+					out.Prompt[index].Resource = &resource
+					if strings.TrimSpace(out.Prompt[index].Name) == "" {
+						out.Prompt[index].Name = resourceDisplayName(block.Resource.URI, "resource")
+					}
+				}
+			}
 			if resourceKind == runtimeacp.EmbeddedResourceBlob {
+				if len(candidates) >= limits.MaxFiles {
+					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt contains more than %d local file inputs", limits.MaxFiles)
+				}
+				if int64(base64.StdEncoding.DecodedLen(len(block.Resource.Blob))) > limits.MaxFileBytes+2 {
+					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: decoded resource exceeds per-file limit", index)
+				}
+				if err := validatePromptResourceBase64(block.Resource.Blob); err != nil {
+					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: %w", index, err)
+				}
 				originalURI, err := safePreparedOriginalURI(block.Resource.URI)
 				if err != nil {
 					return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt block %d: invalid embedded resource URI: %w", index, err)
@@ -687,6 +776,9 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			}
 			if !local {
 				continue
+			}
+			if len(candidates) >= limits.MaxFiles {
+				return runtimeacp.PromptParams{}, nil, fmt.Errorf("prompt contains more than %d local file inputs", limits.MaxFiles)
 			}
 			info, err := os.Lstat(sourcePath)
 			if err != nil {
@@ -717,12 +809,12 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 	}
 	tempParent, err := preparePromptResourceParent(tempDir)
 	if err != nil {
-		return runtimeacp.PromptParams{}, nil, fmt.Errorf("validate prompt resource temporary parent: %w", scrubPathError(err))
+		return runtimeacp.PromptParams{}, nil, promptResourceStagingFailure("validate prompt resource temporary parent", scrubPathError(err))
 	}
 
 	anchor, dir, guard, err := createPromptResourceStage(tempParent)
 	if err != nil {
-		return runtimeacp.PromptParams{}, nil, fmt.Errorf("create protected prompt resource stage: %w", scrubPathError(err))
+		return runtimeacp.PromptParams{}, nil, promptResourceStagingFailure("create protected prompt resource stage", scrubPathError(err))
 	}
 	stage := &promptResourceStage{dir: dir, anchor: anchor, cleanupHook: cleanupHook, guard: guard}
 	fail := func(cause error) (runtimeacp.PromptParams, *promptResourceStage, error) {
@@ -731,18 +823,21 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		}
 		return runtimeacp.PromptParams{}, nil, cause
 	}
+	if err := stage.guard.SetExpectedFiles(len(candidates)); err != nil {
+		return fail(promptResourceStagingFailure("configure private prompt resource stage", err))
+	}
 	if err := stage.guard.Secure(); err != nil {
-		return fail(fmt.Errorf("secure private prompt resource directory: %w", scrubPathError(err)))
+		return fail(promptResourceStagingFailure("secure private prompt resource directory", scrubPathError(err)))
 	}
 	if err := stage.verify(); err != nil {
-		return fail(fmt.Errorf("verify private prompt resource directory: %w", scrubPathError(err)))
+		return fail(promptResourceStagingFailure("verify private prompt resource directory", scrubPathError(err)))
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fail(errors.New("inspect private prompt resource directory"))
+		return fail(promptResourceStagingFailure("inspect private prompt resource directory", err))
 	}
 	if len(entries) != 0 {
-		return fail(errors.New("private prompt resource directory was not empty after protection"))
+		return fail(promptResourceStagingFailure("verify empty private prompt resource directory", errors.New("directory was not empty after protection")))
 	}
 
 	var totalBytes int64
@@ -764,12 +859,12 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			}
 			file, err := openPromptResource(candidate.sourcePath)
 			if err != nil {
-				return fail(fmt.Errorf("prompt block %d: open local resource: %w", candidate.blockIndex, scrubPathError(err)))
+				return fail(promptResourceStagingFailure("open local prompt resource", scrubPathError(err)))
 			}
 			currentInfo, statErr := file.Stat()
 			if statErr != nil || !currentInfo.Mode().IsRegular() || !os.SameFile(candidate.sourceInfo, currentInfo) {
 				_ = file.Close()
-				return fail(fmt.Errorf("prompt block %d: local resource changed during preparation", candidate.blockIndex))
+				return fail(promptResourceStagingFailure("verify local prompt resource identity", statErr))
 			}
 			reader = file
 		} else {
@@ -792,7 +887,7 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 			return fail(fmt.Errorf("prompt block %d: prepare local resource: %w", candidate.blockIndex, writeErr))
 		}
 		if closeErr != nil {
-			return fail(fmt.Errorf("prompt block %d: close local resource", candidate.blockIndex))
+			return fail(promptResourceStagingFailure("close local prompt resource", closeErr))
 		}
 		totalBytes += written
 		stagedURI := fileURIFromPath(destination)
@@ -819,15 +914,23 @@ func preparePromptResources(ctx context.Context, params runtimeacp.PromptParams,
 		out.Prompt[candidate.blockIndex] = block
 	}
 	if _, err := PreparedPromptInputs(out); err != nil {
-		return fail(err)
+		return fail(promptResourceStagingFailure("validate prepared prompt resources", err))
 	}
 	if err := stage.guard.Seal(); err != nil {
-		return fail(errors.New("seal private prompt resource directory"))
+		return fail(promptResourceStagingFailure("seal private prompt resource directory", err))
 	}
 	if err := stage.verify(); err != nil {
-		return fail(fmt.Errorf("verify sealed prompt resource directory: %w", scrubPathError(err)))
+		return fail(promptResourceStagingFailure("verify sealed prompt resource directory", scrubPathError(err)))
 	}
 	return out, stage, nil
+}
+
+func validatePromptResourceBase64(value string) error {
+	decoder := base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(value))
+	if _, err := io.Copy(io.Discard, decoder); err != nil {
+		return errors.New("resource data is not valid base64")
+	}
+	return nil
 }
 
 func safePreparedOriginalURI(rawURI string) (string, error) {
@@ -838,7 +941,7 @@ func safePreparedOriginalURI(rawURI string) (string, error) {
 	if err := validateAbsoluteURI(rawURI); err != nil {
 		return "", err
 	}
-	_, local, err := localResourcePath(rawURI)
+	local, err := sensitiveLocalFileURI(rawURI)
 	if err != nil {
 		return "", err
 	}
@@ -846,6 +949,21 @@ func safePreparedOriginalURI(rawURI string) (string, error) {
 		return "", nil
 	}
 	return rawURI, nil
+}
+
+func sensitiveLocalFileURI(rawURI string) (bool, error) {
+	if rawURI != strings.TrimSpace(rawURI) {
+		return false, errors.New("file URI cannot contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return false, errors.New("malformed URI")
+	}
+	if !strings.EqualFold(parsed.Scheme, "file") {
+		return false, nil
+	}
+	_, err = parseLocalFileURI(rawURI)
+	return true, err
 }
 
 func normalizedPromptResourceLimits(limits PromptResourceLimits) PromptResourceLimits {
@@ -864,7 +982,7 @@ func normalizedPromptResourceLimits(limits PromptResourceLimits) PromptResourceL
 func writePrivatePromptResource(ctx context.Context, destination string, reader io.Reader, maxBytes int64, protect func(string) error) (int64, error) {
 	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return 0, errors.New("create staged resource")
+		return 0, promptResourceStagingFailure("create staged prompt resource", err)
 	}
 	closed := false
 	defer func() {
@@ -873,13 +991,13 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 		}
 	}()
 	if err := securePrivatePromptResourceFile(file, 0o600); err != nil {
-		return 0, errors.New("verify staged resource permissions")
+		return 0, promptResourceStagingFailure("verify staged prompt resource permissions", err)
 	}
 	if protect == nil {
-		return 0, errors.New("staged resource identity protection is unavailable")
+		return 0, promptResourceStagingFailure("protect staged prompt resource identity", errors.New("identity protection is unavailable"))
 	}
 	if err := protect(destination); err != nil {
-		return 0, errors.New("retain staged resource identity")
+		return 0, promptResourceStagingFailure("protect staged prompt resource identity", err)
 	}
 
 	buffer := make([]byte, 32*1024)
@@ -897,10 +1015,10 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 			for len(output) > 0 {
 				n, writeErr := file.Write(output)
 				if writeErr != nil {
-					return written, errors.New("write staged resource")
+					return written, promptResourceStagingFailure("write staged prompt resource", writeErr)
 				}
 				if n == 0 {
-					return written, errors.New("staged resource writer made no progress")
+					return written, promptResourceStagingFailure("write staged prompt resource", errors.New("writer made no progress"))
 				}
 				written += int64(n)
 				output = output[n:]
@@ -910,17 +1028,21 @@ func writePrivatePromptResource(ctx context.Context, destination string, reader 
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return written, errors.New("decode or read resource")
+			var corruptInput base64.CorruptInputError
+			if errors.As(readErr, &corruptInput) {
+				return written, errors.New("resource data is not valid base64")
+			}
+			return written, promptResourceStagingFailure("decode or read prompt resource", readErr)
 		}
 		if count == 0 {
-			return written, errors.New("resource reader made no progress")
+			return written, promptResourceStagingFailure("read prompt resource", errors.New("reader made no progress"))
 		}
 	}
 	if err := securePrivatePromptResourceFile(file, 0o400); err != nil {
-		return written, errors.New("secure staged resource")
+		return written, promptResourceStagingFailure("secure staged prompt resource", err)
 	}
 	if err := file.Close(); err != nil {
-		return written, errors.New("close staged resource")
+		return written, promptResourceStagingFailure("close staged prompt resource", err)
 	}
 	closed = true
 	return written, nil
@@ -962,31 +1084,11 @@ func validateAbsoluteURI(rawURI string) error {
 }
 
 func fileURIToPathForOS(rawURI, goos string) (string, error) {
-	if rawURI != strings.TrimSpace(rawURI) {
-		return "", errors.New("file URI cannot contain surrounding whitespace")
-	}
-	parsed, err := url.Parse(rawURI)
-	if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
-		return "", errors.New("valid file URI is required")
-	}
-	if parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("file URI cannot contain opaque data, credentials, query, or fragment")
-	}
-	if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
-		return "", errors.New("remote file URI hosts are not allowed")
+	parsed, err := parseLocalFileURI(rawURI)
+	if err != nil {
+		return "", err
 	}
 	decodedPath := parsed.Path
-	if decodedPath == "" || strings.ContainsRune(decodedPath, 0) || !utf8.ValidString(decodedPath) {
-		return "", errors.New("file URI path is invalid")
-	}
-	if strings.Contains(decodedPath, `\`) {
-		return "", errors.New("file URI path must use forward slashes")
-	}
-	for _, segment := range strings.Split(decodedPath, "/") {
-		if segment == ".." {
-			return "", errors.New("file URI traversal is not allowed")
-		}
-	}
 
 	if goos == "windows" {
 		if len(decodedPath) < 4 || decodedPath[0] != '/' || !isASCIILetter(decodedPath[1]) || decodedPath[2] != ':' || decodedPath[3] != '/' {
@@ -994,10 +1096,39 @@ func fileURIToPathForOS(rawURI, goos string) (string, error) {
 		}
 		return strings.ReplaceAll(decodedPath[1:], "/", `\`), nil
 	}
-	if !strings.HasPrefix(decodedPath, "/") {
-		return "", errors.New("absolute file URI path is required")
+	return path.Clean(decodedPath), nil
+}
+
+func parseLocalFileURI(rawURI string) (*url.URL, error) {
+	if rawURI != strings.TrimSpace(rawURI) {
+		return nil, errors.New("file URI cannot contain surrounding whitespace")
 	}
-	return filepath.Clean(decodedPath), nil
+	parsed, err := url.Parse(rawURI)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
+		return nil, errors.New("valid file URI is required")
+	}
+	if parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("file URI cannot contain opaque data, credentials, query, or fragment")
+	}
+	if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+		return nil, errors.New("remote file URI hosts are not allowed")
+	}
+	decodedPath := parsed.Path
+	if decodedPath == "" || strings.ContainsRune(decodedPath, 0) || !utf8.ValidString(decodedPath) {
+		return nil, errors.New("file URI path is invalid")
+	}
+	if strings.Contains(decodedPath, `\`) {
+		return nil, errors.New("file URI path must use forward slashes")
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == ".." {
+			return nil, errors.New("file URI traversal is not allowed")
+		}
+	}
+	if !strings.HasPrefix(decodedPath, "/") {
+		return nil, errors.New("absolute file URI path is required")
+	}
+	return parsed, nil
 }
 
 func fileURIFromPath(localPath string) string {

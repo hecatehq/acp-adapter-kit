@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
 	"github.com/hecatehq/acp-adapter-kit/acptest"
@@ -217,6 +218,50 @@ func TestPreparedPromptInputsSuppressLocalEmbeddedTextURI(t *testing.T) {
 	}
 }
 
+func TestBridgeSanitizesLocalEmbeddedTextURIBeforeArbitraryBuilder(t *testing.T) {
+	const privateURI = "file:///private/operator/meeting%20notes.txt"
+	var captured runtimeacp.PromptParams
+	bridge := New(Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(_ Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			captured = params
+			return adapterprocess.Spec{}, errors.New("builder rejected identifier " + params.Prompt[0].Resource.URI)
+		},
+	})
+	client := acptest.NewClient(t, promptInputServer(bridge))
+	client.Request("session/new", map[string]any{"cwd": t.TempDir()})
+	responses := client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "prompt-1",
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt": []map[string]any{{
+				"type": "resource",
+				"resource": map[string]any{
+					"uri":      privateURI,
+					"mimeType": "text/plain",
+					"text":     "safe embedded contents",
+				},
+			}},
+		},
+	})
+	if len(captured.Prompt) != 1 || captured.Prompt[0].Resource == nil {
+		t.Fatalf("captured prompt = %#v", captured)
+	}
+	block := captured.Prompt[0]
+	if block.Resource.URI != privateEmbeddedResourceURI || block.Name != "meeting notes.txt" {
+		t.Fatalf("builder resource URI/name = %q/%q, want sentinel and safe display name", block.Resource.URI, block.Name)
+	}
+	raw, err := json.Marshal(responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), privateURI) || strings.Contains(string(raw), "/private/operator") {
+		t.Fatalf("builder error response leaked local embedded-text identifier: %s", raw)
+	}
+}
+
 func TestPreparePromptResourcesPreservesEmptyEmbeddedResourceVariants(t *testing.T) {
 	params := runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{
 		{
@@ -395,7 +440,7 @@ func TestPreparePromptResourcesEnforcesConfiguredLimitsAndCleansPartialStage(t *
 			name:   "invalid base64",
 			limits: PromptResourceLimits{MaxFiles: 1, MaxFileBytes: 8, MaxTotalBytes: 8},
 			prompt: []runtimeacp.ContentBlock{{Type: "image", Data: "%%%", MimeType: "image/png"}},
-			want:   "decode or read resource",
+			want:   "not valid base64",
 		},
 	}
 	for _, test := range tests {
@@ -419,12 +464,94 @@ func TestPreparePromptResourcesEnforcesConfiguredLimitsAndCleansPartialStage(t *
 	}
 }
 
+func TestPreparationFailureAbandonsGuardsAfterBoundedCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	attempts := 0
+	_, stage, err := preparePromptResources(context.Background(), runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{{
+		Type:     "image",
+		MimeType: "image/png",
+		Data:     base64.StdEncoding.EncodeToString([]byte("four")),
+	}}}, PromptResourceLimits{MaxFiles: 1, MaxFileBytes: 4, MaxTotalBytes: 1}, root, func(string) error {
+		attempts++
+		return errors.New("persistent cleanup failure")
+	})
+	var cleanupErr *promptResourceCleanupError
+	if stage != nil || !errors.As(err, &cleanupErr) {
+		t.Fatalf("prepare result stage=%#v error=%v, want cleanup failure without returned ownership", stage, err)
+	}
+	if attempts != promptResourceCleanupAttempts {
+		t.Fatalf("cleanup attempts = %d, want %d", attempts, promptResourceCleanupAttempts)
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("protected remnants = %#v, want one abandoned anchor", entries)
+	}
+	// This production path returns no stage pointer. Successful manual removal
+	// proves bounded failure closed retained POSIX descriptors/Windows handles.
+	if err := os.RemoveAll(filepath.Join(root, entries[0].Name())); err != nil {
+		t.Fatalf("remove abandoned preparation remnant after handles closed: %v", err)
+	}
+}
+
 func TestPreparePromptResourcesRejectsRelativeTemporaryParent(t *testing.T) {
 	_, stage, err := preparePromptResources(context.Background(), runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{{
 		Type: "image", MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("image")),
 	}}}, PromptResourceLimits{}, "relative-temp", nil)
-	if stage != nil || err == nil || !strings.Contains(err.Error(), "must be absolute") {
-		t.Fatalf("prepare result stage=%#v err=%v, want absolute-parent error", stage, err)
+	var stagingErr *promptResourceStagingError
+	if stage != nil || !errors.As(err, &stagingErr) || err.Error() != "validate prompt resource temporary parent failed" {
+		t.Fatalf("prepare result stage=%#v err=%v, want scrubbed operational staging error", stage, err)
+	}
+}
+
+func TestBridgeDistinguishesPromptValidationFromOperationalStagingFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		tempDir  string
+		data     string
+		wantCode int
+		wantMsg  string
+	}{
+		{name: "malformed prompt data", tempDir: t.TempDir(), data: "%%%", wantCode: -32602, wantMsg: "prepare prompt resources"},
+		{name: "invalid staging configuration", tempDir: "relative-sensitive-parent", data: base64.StdEncoding.EncodeToString([]byte("image")), wantCode: -32000, wantMsg: "prompt resource staging failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bridge := New(Spec{
+				NewID:                 func() string { return "session-1" },
+				PromptResourceTempDir: test.tempDir,
+				BuildPrompt: func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+					return adapterprocess.Spec{Command: "agent"}, nil
+				},
+				Runner: RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+					return adapterprocess.Result{}, nil
+				}),
+			})
+			client := acptest.NewClient(t, promptInputServer(bridge))
+			client.Request("session/new", map[string]any{"cwd": t.TempDir()})
+			responses := client.Send(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      "prompt-1",
+				"method":  "session/prompt",
+				"params": map[string]any{
+					"sessionId": "session-1",
+					"prompt":    []map[string]any{{"type": "image", "mimeType": "image/png", "data": test.data}},
+				},
+			})
+			final := responses[len(responses)-1]
+			if final.Error == nil || final.Error.Code != test.wantCode || final.Error.Message != test.wantMsg {
+				t.Fatalf("response = %#v, want %d/%q", final, test.wantCode, test.wantMsg)
+			}
+			raw, err := json.Marshal(final.Error)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), test.tempDir) || strings.Contains(string(raw), "must be absolute") {
+				t.Fatalf("RPC error leaked staging configuration or raw OS detail: %s", raw)
+			}
+		})
 	}
 }
 
@@ -451,6 +578,63 @@ func TestFileURIPathValidationAcrossPlatforms(t *testing.T) {
 				t.Fatalf("path = %q, want %q", got, test.path)
 			}
 		})
+	}
+}
+
+func TestPromptResourcePathDirUsesTargetOSSemantics(t *testing.T) {
+	tests := []struct {
+		name      string
+		localPath string
+		goos      string
+		want      string
+	}{
+		{name: "unix", localPath: "/tmp/private-stage/input.bin", goos: "linux", want: "/tmp/private-stage"},
+		{name: "windows", localPath: `C:\Temp\private-stage\input.bin`, goos: "windows", want: `C:\Temp\private-stage`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := promptResourcePathDir(test.localPath, test.goos); got != test.want {
+				t.Fatalf("promptResourcePathDir(%q, %q) = %q, want %q", test.localPath, test.goos, got, test.want)
+			}
+		})
+	}
+}
+
+func TestPromptResourceStreamRedactorBoundsInvalidUTF8PendingBytes(t *testing.T) {
+	alias := "/private/prompt-resource/alias"
+	stream := (promptResourceRedactor{aliases: []string{alias}}).Stream()
+	chunk := strings.Repeat(string([]byte{0x80}), 257)
+	var output strings.Builder
+	for index := 0; index < 128; index++ {
+		output.WriteString(stream.Push(chunk))
+		if got, max := len(stream.pending), len(alias)+utf8.UTFMax-2; got > max {
+			t.Fatalf("pending invalid UTF-8 bytes = %d, want at most %d", got, max)
+		}
+	}
+	output.WriteString(stream.Flush())
+	want := strings.Repeat(chunk, 128)
+	if output.String() != want {
+		t.Fatalf("redacted invalid UTF-8 output length/content changed: got %d bytes, want %d", output.Len(), len(want))
+	}
+}
+
+func TestPromptResourceStreamRedactorPreservesUTF8AcrossFirstBoundary(t *testing.T) {
+	stream := (promptResourceRedactor{aliases: []string{"xxxx"}}).Stream()
+	want := "éabc"
+	chunks := []string{
+		stream.Push("éab"),
+		stream.Push("c"),
+		stream.Flush(),
+	}
+	var output strings.Builder
+	for index, chunk := range chunks {
+		if !utf8.ValidString(chunk) {
+			t.Fatalf("output chunk %d split a valid UTF-8 rune: %x", index, []byte(chunk))
+		}
+		output.WriteString(chunk)
+	}
+	if got := output.String(); got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
 	}
 }
 
@@ -602,9 +786,9 @@ func TestBridgeResourceStageCleansOnSuccessErrorAndCancellation(t *testing.T) {
 
 func TestBridgeFailsClosedWhenPromptResourceCleanupFails(t *testing.T) {
 	var stageDir string
-	var failedStage *promptResourceStage
 	var sessions []Session
 	var builtPrompts []runtimeacp.PromptParams
+	cleanupAttempts := 0
 	bridge := New(Spec{
 		NewID:             func() string { return "session-1" },
 		IncludeTranscript: true,
@@ -626,8 +810,8 @@ func TestBridgeFailsClosedWhenPromptResourceCleanupFails(t *testing.T) {
 			return adapterprocess.Result{Stdout: []byte("answer that must not be recorded before cleanup")}, nil
 		}),
 	})
-	bridge.promptStagePrepared = func(stage *promptResourceStage) { failedStage = stage }
 	bridge.promptResourceCleanupHook = func(string) error {
+		cleanupAttempts++
 		return errors.New("injected cleanup failure")
 	}
 	client := acptest.NewClient(t, promptInputServer(bridge))
@@ -644,7 +828,10 @@ func TestBridgeFailsClosedWhenPromptResourceCleanupFails(t *testing.T) {
 		t.Fatalf("cleanup response leaked ephemeral path: %s", raw)
 	}
 	if _, err := os.Stat(stageDir); err != nil {
-		t.Fatalf("failed cleanup did not retain protected stage for retry: %v", err)
+		t.Fatalf("failed cleanup did not leave a protected remnant: %v", err)
+	}
+	if cleanupAttempts != promptResourceCleanupAttempts {
+		t.Fatalf("cleanup attempts = %d, want bounded %d", cleanupAttempts, promptResourceCleanupAttempts)
 	}
 	client.Send(map[string]any{
 		"jsonrpc": "2.0", "id": "prompt-2", "method": "session/prompt",
@@ -658,12 +845,11 @@ func TestBridgeFailsClosedWhenPromptResourceCleanupFails(t *testing.T) {
 		strings.Contains(builtPrompts[1].Prompt[0].Text, "Previous conversation") {
 		t.Fatalf("follow-up params = %#v, want no transcript from failed-cleanup prompt", builtPrompts)
 	}
-	if failedStage == nil {
-		t.Fatal("failed cleanup stage was not captured for retry")
+	if err := os.Chmod(stageDir, 0o700); err != nil {
+		t.Fatalf("make abandoned protected remnant removable: %v", err)
 	}
-	failedStage.cleanupHook = nil
-	if err := failedStage.cleanup(); err != nil {
-		t.Fatalf("retry protected cleanup: %v", err)
+	if err := os.RemoveAll(filepath.Dir(stageDir)); err != nil {
+		t.Fatalf("manually remove abandoned protected remnant: %v", err)
 	}
 }
 

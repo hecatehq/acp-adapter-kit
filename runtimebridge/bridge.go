@@ -219,9 +219,11 @@ func (b *Bridge) callWithEvents(ctx *acp.MethodContext, call func(context.Contex
 		result any
 		err    error
 	}
+	callCtx, cancelCall := context.WithCancel(methodContext(ctx))
+	defer cancelCall()
 	done := make(chan callResult, 1)
 	go func() {
-		result, err := call(methodContext(ctx))
+		result, err := call(callCtx)
 		done <- callResult{result: result, err: err}
 	}()
 
@@ -244,7 +246,7 @@ func (b *Bridge) callWithEvents(ctx *acp.MethodContext, call func(context.Contex
 				}
 				clientDone := make(chan clientRequestResult, 1)
 				go func() {
-					result, rpcErr, err := ctx.Request(event.Method, eventParams(event))
+					result, rpcErr, err := ctx.RequestContext(callCtx, event.Method, eventParams(event))
 					clientDone <- clientRequestResult{result: result, rpcErr: rpcErr, err: err}
 				}()
 				select {
@@ -256,6 +258,12 @@ func (b *Bridge) callWithEvents(ctx *acp.MethodContext, call func(context.Contex
 						return nil, mapRuntimeError(fmt.Errorf("respond to runtime client request %s: %w", string(event.ID), err))
 					}
 				case result := <-done:
+					// The runtime call owns every forwarded child request. Cancel and
+					// await the forwarding goroutine before returning so RequestContext
+					// abandons its pending id and queues best-effort cancellation ahead
+					// of the enclosing prompt response.
+					cancelCall()
+					<-clientDone
 					if result.err != nil {
 						return nil, mapRuntimeError(result.err)
 					}

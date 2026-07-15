@@ -601,6 +601,13 @@ func isShellCommand(command string) bool {
 	}
 }
 
+func isCommandNotFound(err error) bool {
+	// Windows' os/exec reports an absolute executable that is absent as the
+	// portable exec.ErrNotFound sentinel rather than an os.PathError satisfying
+	// os.IsNotExist. Preserve the same typed contract on every supported host.
+	return os.IsNotExist(err) || errors.Is(err, exec.ErrNotFound)
+}
+
 type limitedBuffer struct {
 	mu        sync.Mutex
 	buf       bytes.Buffer

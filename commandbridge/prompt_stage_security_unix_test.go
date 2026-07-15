@@ -8,7 +8,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
@@ -24,12 +23,13 @@ func TestPreparePromptResourcesRejectsUnsafeAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, stage, err := preparePromptResources(context.Background(), oneImagePrompt(), PromptResourceLimits{}, unsafeParent, nil)
-	if stage != nil || err == nil || !strings.Contains(err.Error(), "sticky bit") {
-		t.Fatalf("prepare result stage=%#v err=%v, want unsafe-ancestor rejection", stage, err)
+	var stagingErr *promptResourceStagingError
+	if stage != nil || !errors.As(err, &stagingErr) || stagingErr.operation != "validate prompt resource temporary parent" {
+		t.Fatalf("prepare result stage=%#v err=%v, want operational unsafe-ancestor rejection", stage, err)
 	}
 }
 
-func TestPromptResourceStageGuardRetainsSafeCleanupRetry(t *testing.T) {
+func TestPromptResourceStageGuardRetriesTransientCleanupInCall(t *testing.T) {
 	prepared, stage, err := preparePromptResources(context.Background(), oneImagePrompt(), PromptResourceLimits{}, t.TempDir(), nil)
 	if err != nil || len(prepared.Prompt) != 1 || stage == nil {
 		t.Fatalf("prepare result stage=%#v err=%v", stage, err)
@@ -43,20 +43,14 @@ func TestPromptResourceStageGuardRetainsSafeCleanupRetry(t *testing.T) {
 		}
 		return nil
 	}
-	if err := stage.cleanup(); err == nil {
-		t.Fatal("first cleanup succeeded, want transient failure")
-	}
-	if stage.guard == nil || stage.dir == "" {
-		t.Fatal("failed cleanup discarded retained identity protection")
-	}
 	if err := stage.cleanup(); err != nil {
-		t.Fatalf("retry cleanup: %v", err)
+		t.Fatalf("bounded cleanup retry: %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("cleanup attempts = %d, want 2", attempts)
 	}
 	if _, err := os.Stat(anchor); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("private anchor still exists after retry: %v", err)
+		t.Fatalf("private anchor still exists after bounded retry: %v", err)
 	}
 }
 
@@ -73,7 +67,8 @@ func TestPromptResourceCleanupDoesNotMutateReplacementPermissions(t *testing.T) 
 	if err := os.Mkdir(originalPath, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	if err := stage.cleanup(); err == nil {
+	guard := stage.guard.(*unixPromptResourceStageGuard)
+	if err := guard.Cleanup(nil); err == nil {
 		t.Fatal("cleanup succeeded after stage replacement")
 	}
 	replacement, err := os.Stat(originalPath)
@@ -83,7 +78,6 @@ func TestPromptResourceCleanupDoesNotMutateReplacementPermissions(t *testing.T) 
 	if got := replacement.Mode().Perm(); got != 0o555 {
 		t.Fatalf("replacement mode = %o, want unchanged 555", got)
 	}
-	guard := stage.guard.(*unixPromptResourceStageGuard)
 	if err := securePromptResourceDirectoryFile(guard.stage.file, 0o700); err != nil {
 		t.Fatal(err)
 	}
