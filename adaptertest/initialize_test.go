@@ -17,6 +17,7 @@ func TestAssertInitializeContract(t *testing.T) {
 			Version: "1.2.3",
 			Capabilities: acp.Capabilities{
 				Images:          true,
+				Audio:           true,
 				EmbeddedContext: true,
 				MCPHTTP:         true,
 				MCPSSE:          true,
@@ -34,6 +35,7 @@ func TestAssertInitializeContract(t *testing.T) {
 		Title:           "Test Adapter",
 		Version:         "1.2.3",
 		Images:          true,
+		Audio:           true,
 		EmbeddedContext: true,
 		MCPHTTP:         true,
 		MCPSSE:          true,

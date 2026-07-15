@@ -27,6 +27,7 @@ type InitializeContract struct {
 	AdditionalDirectories bool
 	Logout                bool
 	AuthMethodIDs         []string
+	Audio                 bool
 }
 
 // AssertInitializeContract verifies the initialize surface Hecate relies on
@@ -44,6 +45,7 @@ func AssertInitializeContract(t testing.TB, server *acp.Server, want InitializeC
 			LoadSession        bool `json:"loadSession"`
 			PromptCapabilities struct {
 				Image           bool `json:"image"`
+				Audio           bool `json:"audio"`
 				EmbeddedContext bool `json:"embeddedContext"`
 			} `json:"promptCapabilities"`
 			MCPCapabilities struct {
@@ -85,6 +87,9 @@ func AssertInitializeContract(t testing.TB, server *acp.Server, want InitializeC
 	}
 	if caps.PromptCapabilities.Image != want.Images {
 		t.Fatalf("promptCapabilities.image = %v, want %v", caps.PromptCapabilities.Image, want.Images)
+	}
+	if caps.PromptCapabilities.Audio != want.Audio {
+		t.Fatalf("promptCapabilities.audio = %v, want %v", caps.PromptCapabilities.Audio, want.Audio)
 	}
 	if caps.PromptCapabilities.EmbeddedContext != want.EmbeddedContext {
 		t.Fatalf("promptCapabilities.embeddedContext = %v, want %v", caps.PromptCapabilities.EmbeddedContext, want.EmbeddedContext)

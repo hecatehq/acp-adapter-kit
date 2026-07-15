@@ -19,6 +19,7 @@ func TestInitializeResponse(t *testing.T) {
 		Version: "test",
 		Capabilities: Capabilities{
 			Images:                true,
+			Audio:                 true,
 			EmbeddedContext:       true,
 			MCPHTTP:               true,
 			LoadSession:           true,
@@ -50,7 +51,7 @@ func TestInitializeResponse(t *testing.T) {
 		t.Fatalf("loadSession = %v, want true", caps["loadSession"])
 	}
 	promptCaps := caps["promptCapabilities"].(map[string]any)
-	if promptCaps["image"] != true || promptCaps["embeddedContext"] != true {
+	if promptCaps["image"] != true || promptCaps["audio"] != true || promptCaps["embeddedContext"] != true {
 		t.Fatalf("prompt capabilities = %#v", promptCaps)
 	}
 	sessionCaps := caps["sessionCapabilities"].(map[string]any)

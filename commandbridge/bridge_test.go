@@ -147,7 +147,12 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 			return adapterprocess.Spec{Command: "agent", Args: []string{"--model", session.Config["model"], text}, Dir: session.CWD}, nil
 		},
 		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
-			if spec.Command != "agent" || strings.Join(spec.Args, " ") != "--model smart hello\n\nfrom resource" || spec.Dir != "/tmp/work" {
+			if spec.Command != "agent" || len(spec.Args) != 3 || spec.Args[0] != "--model" || spec.Args[1] != "smart" ||
+				!strings.Contains(spec.Args[2], "hello") ||
+				!strings.Contains(spec.Args[2], `"kind":"embedded_text"`) ||
+				!strings.Contains(spec.Args[2], `"name":"note.md"`) ||
+				!strings.Contains(spec.Args[2], `"text":"from resource"`) ||
+				spec.Dir != "/tmp/work" {
 				t.Fatalf("process spec = %#v, want model + prompt + cwd", spec)
 			}
 			return adapterprocess.Result{Stdout: []byte("assistant answer\n")}, nil
@@ -217,7 +222,8 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 		start.Update.Title != "Run agent" ||
 		start.Update.Kind != "execute" ||
 		start.Update.Status != "in_progress" ||
-		start.Update.RawInput["command"] != "agent --model smart hello\n\nfrom resource" ||
+		start.Update.RawInput["command"] != "agent" ||
+		start.Update.RawInput["arguments"] != adapterprocess.RedactedValue ||
 		start.Update.RawInput["cwd"] != "/tmp/work" {
 		t.Fatalf("tool start = %#v, want prompt command metadata", start)
 	}
@@ -245,7 +251,9 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 	if promptResult.StopReason != "end_turn" {
 		t.Fatalf("stop reason = %q, want end_turn", promptResult.StopReason)
 	}
-	if saw.ID != "session-1" || saw.Config["model"] != "smart" || sawPrompt != "hello\n\nfrom resource" {
+	if saw.ID != "session-1" || saw.Config["model"] != "smart" ||
+		!strings.Contains(sawPrompt, `"kind":"embedded_text"`) ||
+		!strings.Contains(sawPrompt, `"text":"from resource"`) {
 		t.Fatalf("builder saw session=%#v prompt=%q, want configured session", saw, sawPrompt)
 	}
 }

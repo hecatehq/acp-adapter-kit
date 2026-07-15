@@ -34,6 +34,7 @@ type Capabilities struct {
 	SessionClose          bool
 	SessionDelete         bool
 	AdditionalDirectories bool
+	Audio                 bool
 }
 
 type AuthMethod struct {
@@ -320,6 +321,7 @@ func (s *Server) handle(ctx *MethodContext, req request) response {
 				LoadSession: s.info.Capabilities.LoadSession,
 				PromptCapabilities: promptCapabilities{
 					Image:           s.info.Capabilities.Images,
+					Audio:           s.info.Capabilities.Audio,
 					EmbeddedContext: s.info.Capabilities.EmbeddedContext,
 				},
 				MCPCapabilities: mcpCapabilities{
@@ -458,6 +460,7 @@ type emptyObject struct{}
 
 type promptCapabilities struct {
 	Image           bool `json:"image"`
+	Audio           bool `json:"audio"`
 	EmbeddedContext bool `json:"embeddedContext"`
 }
 
