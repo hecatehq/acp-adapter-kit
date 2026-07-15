@@ -1265,6 +1265,7 @@ func TestBridgeListSessionsReturnsMetadataAndFiltersByWorkspace(t *testing.T) {
 
 func TestBridgeCanIncludeBoundedTranscriptInPromptCommand(t *testing.T) {
 	var prompts []string
+	runCount := 0
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID:                  func() string { return "session-1" },
 		IncludeTranscript:      true,
@@ -1277,12 +1278,11 @@ func TestBridgeCanIncludeBoundedTranscriptInPromptCommand(t *testing.T) {
 			prompts = append(prompts, text)
 			return adapterprocess.Spec{Command: "agent", Args: []string{text}, Dir: session.CWD}, nil
 		},
-		Runner: commandbridge.RunnerFunc(func(_ context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
-			current := spec.Args[0]
-			if marker := "Current user request:\n"; strings.Contains(current, marker) {
-				current = current[strings.LastIndex(current, marker)+len(marker):]
-			}
-			return adapterprocess.Result{Stdout: []byte("answer to " + strings.TrimSpace(current))}, nil
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
+			answers := []string{"answer to first", "answer to second", "answer to third"}
+			answer := answers[runCount]
+			runCount++
+			return adapterprocess.Result{Stdout: []byte(answer)}, nil
 		}),
 	})
 	client := acptest.NewClient(t, server(bridge))
@@ -1301,17 +1301,20 @@ func TestBridgeCanIncludeBoundedTranscriptInPromptCommand(t *testing.T) {
 	if !strings.Contains(prompts[1], "Previous conversation:") ||
 		!strings.Contains(prompts[1], "User:\nfirst") ||
 		!strings.Contains(prompts[1], "Assistant:\nanswer to first") ||
-		!strings.Contains(prompts[1], "Current user request:\nsecond") {
+		!strings.Contains(prompts[1], "Current user request:\n\nsecond") ||
+		strings.Count(prompts[1], "second") != 1 {
 		t.Fatalf("second prompt = %q, want first exchange prelude", prompts[1])
 	}
 	if strings.Contains(prompts[2], "User:\nfirst") ||
 		!strings.Contains(prompts[2], "User:\nsecond") ||
-		!strings.Contains(prompts[2], "Current user request:\nthird") {
+		!strings.Contains(prompts[2], "Current user request:\n\nthird") ||
+		strings.Count(prompts[2], "third") != 1 {
 		t.Fatalf("third prompt = %q, want bounded transcript with only second exchange", prompts[2])
 	}
 }
 
 func TestBridgeCancelStopsActivePrompt(t *testing.T) {
+	const secret = "cancelled-runner-sensitive-output"
 	started := make(chan struct{})
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
@@ -1321,7 +1324,7 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 		Runner: commandbridge.RunnerFunc(func(ctx context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
 			close(started)
 			<-ctx.Done()
-			return adapterprocess.Result{}, ctx.Err()
+			return adapterprocess.Result{Stdout: []byte(secret), Stderr: []byte(secret)}, ctx.Err()
 		}),
 	})
 	srv := server(bridge)
@@ -1344,6 +1347,9 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	client.Notify("session/cancel", map[string]any{"sessionId": "session-1"})
 
 	responses := <-promptDone
+	if raw, _ := json.Marshal(responses); strings.Contains(string(raw), secret) {
+		t.Fatalf("cancelled runner output leaked through notifications: %s", raw)
+	}
 	if len(responses) != 3 {
 		t.Fatalf("got %d responses, want tool start + tool finish + prompt response", len(responses))
 	}
@@ -1363,6 +1369,58 @@ func TestBridgeCancelStopsActivePrompt(t *testing.T) {
 	}
 	responses[2].ResultInto(t, &result)
 	if result.StopReason != "cancelled" {
+		t.Fatalf("stop reason = %q, want cancelled", result.StopReason)
+	}
+}
+
+func TestBridgeCancellationDiscardsBufferedStreamingParserTail(t *testing.T) {
+	const secret = "cancelled-buffered-stream-tail"
+	started := make(chan struct{})
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		NewStreamParser: func(commandbridge.Session, runtimeacp.PromptParams) commandbridge.StreamParser {
+			return commandbridge.NewJSONLStreamParser(func(event map[string]any) (commandbridge.JSONLMapping, error) {
+				text, _ := event["text"].(string)
+				return commandbridge.JSONLMapping{
+					Events:         []commandbridge.StreamEvent{commandbridge.AgentMessageChunk(text)},
+					TranscriptText: text,
+				}, nil
+			})
+		},
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		Runner: streamingRunnerFunc(func(ctx context.Context, _ adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+			chunk := []byte(`{"type":"message","text":"` + secret + `"}`)
+			if err := onStdout(chunk); err != nil {
+				return adapterprocess.Result{}, err
+			}
+			close(started)
+			<-ctx.Done()
+			return adapterprocess.Result{Stdout: chunk, Stderr: []byte(secret)}, ctx.Err()
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	promptDone := make(chan []acptest.Response, 1)
+	go func() { promptDone <- client.Send(promptRequest(2, "session-1", "stop buffered output")) }()
+	<-started
+	client.Notify("session/cancel", map[string]any{"sessionId": "session-1"})
+	responses := <-promptDone
+	if raw, _ := json.Marshal(responses); strings.Contains(string(raw), secret) {
+		t.Fatalf("cancelled parser tail leaked through notifications: %s", raw)
+	}
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + redacted finish + cancelled result: %#v", len(responses), responses)
+	}
+	finish := decodeCommandToolUpdate(t, responses[1])
+	if finish.Update.Status != "failed" || !strings.Contains(finish.Update.Content[0].Content.Text, "cancelled: context canceled") {
+		t.Fatalf("finish = %#v, want redacted cancellation", finish)
+	}
+	var result runtimeacp.PromptResult
+	responses[2].ResultInto(t, &result)
+	if result.StopReason != runtimeacp.StopReasonCancelled {
 		t.Fatalf("stop reason = %q, want cancelled", result.StopReason)
 	}
 }

@@ -2,8 +2,11 @@
 
 package commandbridge
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
-func openPromptResource(path string) (*os.File, error) {
-	return os.Open(path)
+func openPromptResource(string) (*os.File, error) {
+	return nil, errors.New("secure local file prompt inputs are unsupported on this platform")
 }

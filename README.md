@@ -93,14 +93,24 @@ private directory created for that prompt:
 
 Only absolute local URIs that resolve directly to non-symlink regular files are
 accepted. Traversal segments, remote `file:` hosts, directories, devices, and
-symlinks fail closed. On POSIX systems, the stage is private while being
-populated (`0700`), its files are read-only (`0400`), and the completed
-directory is read/execute-only (`0500`) while the command runs; platform ACLs
-and read-only attributes apply elsewhere. The cloned `Session` passed to
-`BuildPrompt` contains the stage as one additional directory; persistent
-session state never does. The stage is removed after success, builder or
-process failure, and cancellation. A cleanup failure changes the prompt result
-to an error.
+symlinks and reparse points fail closed. On Darwin, DragonFly BSD, FreeBSD,
+Linux, NetBSD, and OpenBSD, the stage is private while being populated (`0700`),
+its files are read-only (`0400`), and the completed directory is
+read/execute-only (`0500`) while the command runs. On Windows, preparation
+replaces inherited permissions before writing any bytes with a protected,
+inheritable DACL containing only the current process user and SYSTEM; the kit
+reads the directory DACL back, verifies every new child's inherited DACL before
+writing bytes, and fails closed when the filesystem cannot enforce either.
+Other platforms reject rich file preparation rather than relying on weaker
+filesystem semantics.
+
+The cloned `Session` passed to `BuildPrompt` contains the stage as one
+additional directory; persistent session state never does. The stage is
+removed after success, builder or process failure, and cancellation. Cleanup
+must succeed before prompt counts or transcript state are updated, and a
+cleanup failure changes the prompt result to an error. Exact private paths,
+file URIs, stage names, and staged filenames are scrubbed from builder errors,
+command output, tool activity, final RPC errors, and recorded transcripts.
 
 Preparation defaults to at most 4 files, 5 MiB per file, and 12 MiB total.
 Adapters can lower or raise those provider-neutral bounds with
@@ -109,14 +119,17 @@ Adapters can lower or raise those provider-neutral bounds with
 
 Prompt builders can call `commandbridge.PreparedPromptInputs` for an ordered,
 typed view with exact private paths and preserved link metadata when a provider
-needs flags such as an image argument. `commandbridge.RequirePromptText`
+needs flags such as an image argument. Materialized images and embedded blobs
+also expose safe non-local source metadata as `OriginalURI`; source-local file
+URIs are never exposed. `commandbridge.RequirePromptText`
 renders a fixed, JSON-escaped manifest for command-backed CLIs and returns an
 actionable error for any raw, unprepared, malformed, or unsupported block. The
 legacy `PromptText` helper returns an empty string on that validation failure
 and should not be used when the builder can propagate an error. When transcript
-inclusion is enabled, only ordinary ACP text blocks are copied from user input;
-attachment bodies and rich-resource text are not copied, and prompt-stage paths
-are scrubbed from recorded assistant output.
+inclusion is enabled, a history-only prelude is inserted before the current
+turn while every current text and rich block remains in its original order.
+Only ordinary ACP text blocks enter history; attachment bodies and
+rich-resource text are excluded.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

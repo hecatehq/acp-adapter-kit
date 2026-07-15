@@ -120,8 +120,9 @@ type ContentBlock struct {
 // linked ACP content. Command bridges populate this field before invoking a
 // prompt builder. The path is never serialized onto the ACP wire.
 type PreparedFile struct {
-	Path      string
-	SizeBytes int64
+	Path        string
+	SizeBytes   int64
+	OriginalURI string
 }
 
 type EmbeddedResource struct {
