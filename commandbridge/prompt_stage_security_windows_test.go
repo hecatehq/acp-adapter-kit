@@ -69,6 +69,16 @@ func TestSecurePromptResourceStageUsesProtectedInheritablePrivateDACL(t *testing
 }
 
 func TestWindowsPromptResourceDirectoryInfoLayoutAndBounds(t *testing.T) {
+	for size := 1; size <= 64*1024; size *= 2 {
+		buffer := alignedWindowsPromptResourceDirectoryBuffer(size)
+		if len(buffer) != size {
+			t.Fatalf("aligned directory buffer length = %d, want %d", len(buffer), size)
+		}
+		if address := uintptr(unsafe.Pointer(&buffer[0])); address%8 != 0 {
+			t.Fatalf("aligned directory buffer address %#x is not 8-byte aligned", address)
+		}
+	}
+
 	if got := unsafe.Offsetof(windowsFileFullDirectoryInfo{}.FileNameLength); got != 60 {
 		t.Fatalf("FileNameLength offset = %d, want 60", got)
 	}
