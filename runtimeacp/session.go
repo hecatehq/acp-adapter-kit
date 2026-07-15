@@ -103,13 +103,25 @@ type PromptParams struct {
 }
 
 type ContentBlock struct {
-	Type     string            `json:"type"`
-	Text     string            `json:"text,omitempty"`
-	MimeType string            `json:"mimeType,omitempty"`
-	Data     string            `json:"data,omitempty"`
-	URI      string            `json:"uri,omitempty"`
-	Name     string            `json:"name,omitempty"`
-	Resource *EmbeddedResource `json:"resource,omitempty"`
+	Type         string            `json:"type"`
+	Text         string            `json:"text,omitempty"`
+	MimeType     string            `json:"mimeType,omitempty"`
+	Data         string            `json:"data,omitempty"`
+	URI          string            `json:"uri,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Resource     *EmbeddedResource `json:"resource,omitempty"`
+	Title        string            `json:"title,omitempty"`
+	Description  string            `json:"description,omitempty"`
+	Size         *int64            `json:"size,omitempty"`
+	PreparedFile *PreparedFile     `json:"-"`
+}
+
+// PreparedFile identifies a private, prompt-scoped local copy of binary or
+// linked ACP content. Command bridges populate this field before invoking a
+// prompt builder. The path is never serialized onto the ACP wire.
+type PreparedFile struct {
+	Path      string
+	SizeBytes int64
 }
 
 type EmbeddedResource struct {

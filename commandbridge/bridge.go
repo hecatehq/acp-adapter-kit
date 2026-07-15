@@ -110,6 +110,12 @@ type Spec struct {
 	ClassifyPromptFailure  PromptFailureClassifier
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 	Now                    func() time.Time
+	// PromptResourceLimits bounds prompt-scoped local file preparation.
+	PromptResourceLimits PromptResourceLimits
+	// PromptResourceTempDir selects the parent for private prompt directories.
+	// It must be absolute. The operating-system temporary directory is used when
+	// it is empty.
+	PromptResourceTempDir string
 }
 
 type Bridge struct {
@@ -120,6 +126,9 @@ type Bridge struct {
 	mu       sync.Mutex
 	sessions map[string]*sessionState
 	active   map[string]context.CancelFunc
+
+	removePromptResourceDir func(string) error
+	promptMethodContext     func(*acp.MethodContext) context.Context
 }
 
 type Session struct {
@@ -177,7 +186,6 @@ type sessionInfo struct {
 const (
 	defaultMaxTranscriptExchanges = 8
 	toolOutputPreviewLimit        = 8 * 1024
-	commandPreviewLimit           = 2 * 1024
 )
 
 func New(spec Spec) *Bridge {
@@ -458,32 +466,74 @@ func (b *Bridge) setMode(_ *acp.MethodContext, params json.RawMessage) (any, *ac
 	return map[string]any{}, nil
 }
 
-func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (response any, rpcErr *acp.RPCError) {
 	var req runtimeacp.PromptParams
-	if rpcErr := decodeParams(params, &req); rpcErr != nil {
-		return nil, rpcErr
+	if decodeErr := decodeParams(params, &req); decodeErr != nil {
+		return nil, decodeErr
 	}
 	if b.spec.BuildPrompt == nil {
 		return nil, &acp.RPCError{Code: -32004, Message: "not implemented", Data: "prompt command builder is not configured"}
 	}
-	state, rpcErr := b.session(req.SessionID)
-	if rpcErr != nil {
-		return nil, rpcErr
+	state, sessionErr := b.session(req.SessionID)
+	if sessionErr != nil {
+		return nil, sessionErr
 	}
-	promptParams := b.promptParamsForSession(state, req)
-	runCtx, cancel := context.WithCancel(methodContext(ctx))
-	if rpcErr := b.beginPrompt(req.SessionID, cancel); rpcErr != nil {
+	baseCtx := methodContext(ctx)
+	if b.promptMethodContext != nil {
+		baseCtx = b.promptMethodContext(ctx)
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if err := baseCtx.Err(); err != nil {
+		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
+	runCtx, cancel := context.WithCancel(baseCtx)
+	if beginErr := b.beginPrompt(req.SessionID, cancel); beginErr != nil {
 		cancel()
-		return nil, rpcErr
+		return nil, beginErr
 	}
 	defer b.endPrompt(req.SessionID)
 	defer cancel()
+	if runCtx.Err() != nil {
+		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
 
-	command, err := b.spec.BuildPrompt(state.Session, promptParams)
+	preparedParams, stage, err := preparePromptResources(runCtx, req, b.spec.PromptResourceLimits, b.spec.PromptResourceTempDir, b.removePromptResourceDir)
+	if err != nil {
+		var cleanupErr *promptResourceCleanupError
+		if errors.As(err, &cleanupErr) {
+			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource cleanup failed", Data: cleanupErr.Error()}
+		}
+		if runCtx.Err() != nil {
+			return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+		}
+		return nil, invalidParams("prepare prompt resources", err.Error())
+	}
+	if stage != nil {
+		defer func() {
+			if err := stage.cleanup(); err != nil {
+				response = nil
+				rpcErr = &acp.RPCError{Code: -32000, Message: "prompt resource cleanup failed", Data: err.Error()}
+			}
+		}()
+	}
+	promptParams := b.promptParamsForSession(state, preparedParams)
+	promptSession := state.Session
+	if stage != nil {
+		promptSession.AdditionalDirectories = append(cloneStrings(promptSession.AdditionalDirectories), stage.dir)
+	}
+	if runCtx.Err() != nil {
+		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
+	command, err := b.spec.BuildPrompt(promptSession, promptParams)
 	if err != nil {
 		return nil, invalidParams("build prompt command", err.Error())
 	}
 	parser := b.newStreamParser(state.Session, promptParams)
+	if runCtx.Err() != nil {
+		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
+	}
 	result, assistantText, err := b.runPromptCommand(runCtx, ctx, req.SessionID, command, parser)
 	if runCtx.Err() != nil {
 		return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
@@ -499,7 +549,11 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
 	b.recordPromptSuccess(req.SessionID)
-	if info, ok := b.recordTranscriptExchange(req.SessionID, transcriptPromptText(req), sanitizeTranscriptAssistantText(req, assistantText)); ok {
+	assistantTranscriptText := sanitizeTranscriptAssistantText(req, assistantText)
+	if stage != nil {
+		assistantTranscriptText = scrubPromptResourcePaths(assistantTranscriptText, preparedParams, stage.dir)
+	}
+	if info, ok := b.recordTranscriptExchange(req.SessionID, promptTranscriptText(req), assistantTranscriptText); ok {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
@@ -514,9 +568,19 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 }
 
 func (b *Bridge) runPromptCommand(runCtx context.Context, methodCtx *acp.MethodContext, sessionID string, command adapterprocess.Spec, parser StreamParser) (adapterprocess.Result, string, error) {
+	if err := runCtx.Err(); err != nil {
+		return adapterprocess.Result{}, "", err
+	}
 	toolCallID := b.newToolCallID()
 	if err := notifyPromptToolCallStart(methodCtx, sessionID, toolCallID, command); err != nil {
 		return adapterprocess.Result{}, "", fmt.Errorf("notify prompt tool start: %w", err)
+	}
+	if contextErr := runCtx.Err(); contextErr != nil {
+		result := promptCommandResultForFinish(adapterprocess.Result{}, contextErr)
+		if notifyErr := notifyPromptToolCallFinish(methodCtx, sessionID, toolCallID, command, result, contextErr, contextErr); notifyErr != nil {
+			return adapterprocess.Result{}, "", fmt.Errorf("notify cancelled prompt tool finish: %w", notifyErr)
+		}
+		return adapterprocess.Result{}, "", contextErr
 	}
 
 	if runner, ok := b.spec.Runner.(StreamRunner); ok {
@@ -592,13 +656,20 @@ func (b *Bridge) promptParamsForSession(state *sessionState, req runtimeacp.Prom
 	if !b.spec.IncludeTranscript {
 		return req
 	}
-	userText := PromptText(req)
+	userText := promptTranscriptText(req)
 	if userText == "" || len(state.transcript) == 0 {
 		return req
 	}
 	text := transcriptPrompt(state.transcript, userText)
 	out := req
-	out.Prompt = []runtimeacp.ContentBlock{{Type: "text", Text: text}}
+	out.Prompt = make([]runtimeacp.ContentBlock, 0, len(req.Prompt)+1)
+	out.Prompt = append(out.Prompt, runtimeacp.ContentBlock{Type: "text", Text: text})
+	for _, block := range req.Prompt {
+		if block.Type == "text" {
+			continue
+		}
+		out.Prompt = append(out.Prompt, block)
+	}
 	return out
 }
 
@@ -887,41 +958,32 @@ func (b *Bridge) newToolCallID() string {
 }
 
 func promptCommandTitle(command adapterprocess.Spec) string {
-	name := strings.TrimSpace(command.Command)
+	name := promptCommandExecutable(command)
 	if name == "" {
 		return "Run prompt command"
-	}
-	if base := filepath.Base(name); base != "." && base != string(filepath.Separator) && base != "" {
-		name = base
 	}
 	return "Run " + name
 }
 
+func promptCommandExecutable(command adapterprocess.Spec) string {
+	name := strings.TrimSpace(command.Command)
+	if base := filepath.Base(name); base != "." && base != string(filepath.Separator) && base != "" {
+		name = base
+	}
+	return name
+}
+
 func promptCommandRawInput(command adapterprocess.Spec) map[string]any {
 	input := map[string]any{
-		"command": promptCommandPreview(command),
+		"command": promptCommandExecutable(command),
+	}
+	if len(command.Args) > 0 {
+		input["arguments"] = adapterprocess.RedactedValue
 	}
 	if dir := strings.TrimSpace(command.Dir); dir != "" {
 		input["cwd"] = dir
 	}
 	return input
-}
-
-func promptCommandPreview(command adapterprocess.Spec) string {
-	parts := make([]string, 0, 1+len(command.Args))
-	if strings.TrimSpace(command.Command) != "" {
-		parts = append(parts, command.Command)
-	}
-	for _, arg := range command.Args {
-		if strings.TrimSpace(arg) != "" {
-			parts = append(parts, arg)
-		}
-	}
-	preview := strings.Join(parts, " ")
-	if len(preview) > commandPreviewLimit {
-		return preview[:commandPreviewLimit] + "..."
-	}
-	return preview
 }
 
 func promptCommandToolContent(result adapterprocess.Result, runErr, contextErr error) []map[string]any {
@@ -1311,7 +1373,19 @@ func commandErrorData(result adapterprocess.Result, err error) map[string]any {
 	return data
 }
 
+// PromptText renders a prepared prompt for legacy callers. It returns an empty
+// string when any block is unsupported or has not passed private preparation.
+// New prompt builders should call RequirePromptText and handle its error, or
+// use PreparedPromptInputs for provider-specific argument construction.
 func PromptText(params runtimeacp.PromptParams) string {
+	text, err := renderPreparedPrompt(params)
+	if err != nil {
+		return ""
+	}
+	return text
+}
+
+func legacyPromptText(params runtimeacp.PromptParams) string {
 	return renderPromptText(params, true)
 }
 
@@ -1504,7 +1578,10 @@ func resourceLinkPromptText(block runtimeacp.ContentBlock, includeURI bool) stri
 }
 
 func RequirePromptText(params runtimeacp.PromptParams) (string, error) {
-	text := PromptText(params)
+	text, err := renderPreparedPrompt(params)
+	if err != nil {
+		return "", err
+	}
 	if text == "" {
 		return "", errors.New("prompt text is required")
 	}

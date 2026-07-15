@@ -58,6 +58,7 @@ func TestRunNoArgsServesScaffoldACP(t *testing.T) {
 		AgentCapabilities struct {
 			PromptCapabilities struct {
 				Image           bool `json:"image"`
+				Audio           bool `json:"audio"`
 				EmbeddedContext bool `json:"embeddedContext"`
 			} `json:"promptCapabilities"`
 			MCPCapabilities struct {
@@ -72,8 +73,8 @@ func TestRunNoArgsServesScaffoldACP(t *testing.T) {
 	if result.AgentInfo.Name != "test-acp-adapter" || result.AgentInfo.Title != "Test ACP Adapter" || result.AgentInfo.Version != "1.2.3" {
 		t.Fatalf("agent info = %#v, want configured adapter metadata", result.AgentInfo)
 	}
-	if !result.AgentCapabilities.PromptCapabilities.Image || !result.AgentCapabilities.PromptCapabilities.EmbeddedContext {
-		t.Fatalf("prompt capabilities = %#v, want image + embedded context", result.AgentCapabilities.PromptCapabilities)
+	if !result.AgentCapabilities.PromptCapabilities.Image || !result.AgentCapabilities.PromptCapabilities.Audio || !result.AgentCapabilities.PromptCapabilities.EmbeddedContext {
+		t.Fatalf("prompt capabilities = %#v, want image + audio + embedded context", result.AgentCapabilities.PromptCapabilities)
 	}
 	if !result.AgentCapabilities.MCPCapabilities.HTTP || result.AgentCapabilities.MCPCapabilities.SSE {
 		t.Fatalf("mcp capabilities = %#v, want HTTP only", result.AgentCapabilities.MCPCapabilities)
@@ -180,7 +181,8 @@ func TestCommandBridgeServesSessionMethodsWithoutRuntimeFlags(t *testing.T) {
 	if start.Update.SessionUpdate != "tool_call" ||
 		start.Update.ToolCallID == "" ||
 		start.Update.Status != "in_progress" ||
-		start.Update.RawInput["command"] != "test-agent hello" ||
+		start.Update.RawInput["command"] != "test-agent" ||
+		start.Update.RawInput["arguments"] != adapterprocess.RedactedValue ||
 		start.Update.RawInput["cwd"] != "/tmp/work" {
 		t.Fatalf("tool start = %#v, want command metadata", start)
 	}
@@ -273,6 +275,7 @@ func testSpec(stdin *strings.Reader, stdout *bytes.Buffer, stderr *bytes.Buffer)
 			Version: "1.2.3",
 			Capabilities: acp.Capabilities{
 				Images:          true,
+				Audio:           true,
 				EmbeddedContext: true,
 				MCPHTTP:         true,
 			},
