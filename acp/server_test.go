@@ -651,7 +651,7 @@ func TestMethodContextRequestContextDiscardsLateResponseAfterCancellation(t *tes
 
 func TestMethodContextRequestContextKeepsCancellationAuthoritativeWhenNotificationFails(t *testing.T) {
 	requestCtx, cancel := context.WithCancel(context.Background())
-	writer := &cancelThenFailWriter{cancel: cancel}
+	writer := &cancelThenFailWriter{cancel: cancel, failed: make(chan struct{})}
 	conn := &connection{
 		encoder: json.NewEncoder(writer),
 		pending: map[string]chan clientResponse{},
@@ -661,11 +661,71 @@ func TestMethodContextRequestContextKeepsCancellationAuthoritativeWhenNotificati
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("request error = %v, want context canceled", err)
 	}
+	if err := conn.write(serverNotification{JSONRPC: "2.0", Method: "test/next"}); err == nil {
+		t.Fatal("writer pump succeeded, want queued cancellation notification failure")
+	}
+	select {
+	case <-writer.failed:
+	case <-time.After(time.Second):
+		t.Fatal("best-effort cancellation notification was not consumed by the writer pump")
+	}
 	if writer.calls != 2 {
 		t.Fatalf("writer calls = %d, want request plus failed cancellation notification", writer.calls)
 	}
 	if len(conn.pending) != 0 {
 		t.Fatalf("pending requests = %d, want abandoned", len(conn.pending))
+	}
+}
+
+func TestMethodContextRequestContextCancellationDoesNotBlockOnWriter(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	writer := &cancelThenBlockWriter{
+		cancel:  cancel,
+		blocked: make(chan struct{}),
+		release: release,
+	}
+	conn := &connection{
+		encoder: json.NewEncoder(writer),
+		pending: map[string]chan clientResponse{},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := (&MethodContext{conn: conn, ctx: context.Background()}).RequestContext(requestCtx, "session/request_permission", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("request error = %v, want context canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("request cancellation blocked on the outbound writer")
+	}
+	conn.requestMu.Lock()
+	pending := len(conn.pending)
+	conn.requestMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending requests = %d, want abandoned before best-effort notification completes", pending)
+	}
+	pumpDone := make(chan error, 1)
+	go func() {
+		pumpDone <- conn.write(serverNotification{JSONRPC: "2.0", Method: "test/next"})
+	}()
+	select {
+	case <-writer.blocked:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("next outbound write did not pump the queued cancellation notification")
+	}
+	close(release)
+	select {
+	case err := <-pumpDone:
+		if err != nil {
+			t.Fatalf("pump queued cancellation after release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued cancellation pump did not settle after writer release")
 	}
 }
 
@@ -840,6 +900,7 @@ type serverEnvelope struct {
 type cancelThenFailWriter struct {
 	cancel context.CancelFunc
 	calls  int
+	failed chan struct{}
 }
 
 func (w *cancelThenFailWriter) Write(data []byte) (int, error) {
@@ -848,7 +909,28 @@ func (w *cancelThenFailWriter) Write(data []byte) (int, error) {
 		w.cancel()
 		return len(data), nil
 	}
+	close(w.failed)
 	return 0, errors.New("write failed")
+}
+
+type cancelThenBlockWriter struct {
+	cancel  context.CancelFunc
+	blocked chan struct{}
+	release <-chan struct{}
+	calls   int
+}
+
+func (w *cancelThenBlockWriter) Write(data []byte) (int, error) {
+	w.calls++
+	if w.calls == 1 {
+		w.cancel()
+		return len(data), nil
+	}
+	if w.calls == 2 {
+		close(w.blocked)
+		<-w.release
+	}
+	return len(data), nil
 }
 
 type serverTestClient struct {

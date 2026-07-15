@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,25 @@ func TestSecurePromptResourceStageUsesProtectedInheritablePrivateDACL(t *testing
 	assertPromptStageACLEntries(t, childDescriptor, allowed, false)
 }
 
+func TestPrivateWindowsPromptResourceDescriptorDeduplicatesLocalSystem(t *testing.T) {
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := privateWindowsPromptResourceSecurityDescriptorFor([]*windows.SID{system})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner == nil || !owner.Equals(system) {
+		t.Fatalf("descriptor owner = %v, want LocalSystem", owner)
+	}
+	assertPromptStageACLEntries(t, descriptor, []*windows.SID{system}, true)
+}
+
 func TestWindowsPromptResourceDirectoriesArePrivateAtCreation(t *testing.T) {
 	parent, err := preparePromptResourceParent(t.TempDir())
 	if err != nil {
@@ -81,6 +101,38 @@ func TestWindowsPromptResourceDirectoriesArePrivateAtCreation(t *testing.T) {
 	}
 	if err := verifyPromptResourceStageACLHandle(guard.stage.handle, allowed); err != nil {
 		t.Fatalf("stage ACL immediately after creation: %v", err)
+	}
+}
+
+func TestWindowsPromptResourceGuardSupportsConfiguredInputsAboveDefault(t *testing.T) {
+	const fileCount = DefaultMaxPromptResourceFiles + 2
+	params := runtimeacp.PromptParams{Prompt: make([]runtimeacp.ContentBlock, 0, fileCount)}
+	for index := 0; index < fileCount; index++ {
+		params.Prompt = append(params.Prompt, runtimeacp.ContentBlock{
+			Type:     "image",
+			MimeType: "image/png",
+			Name:     fmt.Sprintf("image-%d.png", index),
+			Data:     base64.StdEncoding.EncodeToString([]byte{byte(index)}),
+		})
+	}
+	prepared, stage, err := preparePromptResources(context.Background(), params, PromptResourceLimits{
+		MaxFiles:      fileCount,
+		MaxFileBytes:  1,
+		MaxTotalBytes: fileCount,
+	}, t.TempDir(), nil)
+	if err != nil || stage == nil {
+		t.Fatalf("prepare %d configured files: stage=%#v error=%v", fileCount, stage, err)
+	}
+	defer func() { _ = stage.cleanup() }()
+	if len(prepared.Prompt) != fileCount {
+		t.Fatalf("prepared prompt count = %d, want %d", len(prepared.Prompt), fileCount)
+	}
+	guard := stage.guard.(*windowsPromptResourceStageGuard)
+	if len(guard.files) != fileCount || guard.expectedFiles != fileCount {
+		t.Fatalf("guard files/expected = %d/%d, want %d/%d", len(guard.files), guard.expectedFiles, fileCount, fileCount)
+	}
+	if err := stage.verify(); err != nil {
+		t.Fatalf("verify configured files above default: %v", err)
 	}
 }
 
@@ -119,14 +171,8 @@ func TestWindowsPromptResourceGuardBlocksReplacementAndRetainsCleanupRetry(t *te
 		}
 		return nil
 	}
-	if err := stage.cleanup(); err == nil {
-		t.Fatal("first cleanup succeeded, want transient failure")
-	}
-	if stage.guard == nil {
-		t.Fatal("failed cleanup discarded Windows identity protection")
-	}
 	if err := stage.cleanup(); err != nil {
-		t.Fatalf("retry cleanup: %v", err)
+		t.Fatalf("bounded cleanup retry: %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("cleanup attempts = %d, want 2", attempts)
@@ -180,7 +226,7 @@ func TestWindowsPromptResourceGuardRetainsFilesWithoutRequiringDeleteSharing(t *
 	}
 }
 
-func TestWindowsPromptResourceCleanupRestoresGuardAfterReaderBlocksDelete(t *testing.T) {
+func TestWindowsPromptResourceCleanupAbandonsDirectoryGuardsAfterBoundedReaderFailure(t *testing.T) {
 	params := runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{{
 		Type:     "image",
 		MimeType: "image/png",
@@ -190,27 +236,49 @@ func TestWindowsPromptResourceCleanupRestoresGuardAfterReaderBlocksDelete(t *tes
 	if err != nil || stage == nil {
 		t.Fatalf("prepare result stage=%#v err=%v", stage, err)
 	}
-	reader, err := os.Open(stage.dir)
+	anchor := stage.anchor
+	stageDir := stage.dir
+	guard := stage.guard.(*windowsPromptResourceStageGuard)
+	stagePath16, err := windows.UTF16PtrFromString(stage.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := windows.CreateFile(
+		stagePath16,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := stage.cleanup(); err == nil {
-		_ = reader.Close()
+		_ = windows.CloseHandle(reader)
 		t.Fatal("cleanup succeeded while a reader denied delete sharing")
 	}
-	if stage.guard == nil {
-		_ = reader.Close()
-		t.Fatal("blocked cleanup discarded restored stage identity protection")
+	if stage.guard != nil || stage.dir != "" {
+		_ = windows.CloseHandle(reader)
+		t.Fatal("persistent cleanup failure did not abandon unreachable stage ownership")
 	}
-	if err := reader.Close(); err != nil {
+	if guard.stage.handle != windows.InvalidHandle || guard.anchor.handle != windows.InvalidHandle || len(guard.ancestors) != 0 {
+		_ = windows.CloseHandle(reader)
+		t.Fatal("persistent cleanup failure leaked retained Windows directory handles")
+	}
+	if err := windows.CloseHandle(reader); err != nil {
 		t.Fatal(err)
 	}
-	if err := stage.cleanup(); err != nil {
-		t.Fatalf("cleanup after reader closed: %v", err)
+	if err := os.Remove(stageDir); err != nil {
+		t.Fatalf("manually remove abandoned stage after reader closed: %v", err)
+	}
+	if err := os.Remove(anchor); err != nil {
+		t.Fatalf("manually remove abandoned anchor after reader closed: %v", err)
 	}
 }
 
-func TestWindowsPromptResourceCleanupRestoresFileGuardAfterReaderBlocksDelete(t *testing.T) {
+func TestWindowsPromptResourceCleanupAbandonsFileGuardsAfterBoundedReaderFailure(t *testing.T) {
 	params := runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{{
 		Type:     "image",
 		MimeType: "image/png",
@@ -220,24 +288,167 @@ func TestWindowsPromptResourceCleanupRestoresFileGuardAfterReaderBlocksDelete(t 
 	if err != nil || stage == nil {
 		t.Fatalf("prepare result stage=%#v err=%v", stage, err)
 	}
-	reader, err := os.Open(prepared.Prompt[0].PreparedFile.Path)
+	anchor := stage.anchor
+	stageDir := stage.dir
+	stagedPath := prepared.Prompt[0].PreparedFile.Path
+	guard := stage.guard.(*windowsPromptResourceStageGuard)
+	fileGuard := guard.files[windowsPromptResourceNameKey(filepath.Base(stagedPath))]
+	stagedPath16, err := windows.UTF16PtrFromString(stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := windows.CreateFile(
+		stagedPath16,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := stage.cleanup(); err == nil {
-		_ = reader.Close()
+		_ = windows.CloseHandle(reader)
 		t.Fatal("cleanup succeeded while a file reader denied delete sharing")
 	}
-	if stage.guard == nil {
-		_ = reader.Close()
-		t.Fatal("blocked cleanup discarded restored file identity protection")
+	if stage.guard != nil || stage.dir != "" {
+		_ = windows.CloseHandle(reader)
+		t.Fatal("persistent cleanup failure did not abandon unreachable stage ownership")
 	}
-	if err := reader.Close(); err != nil {
+	if guard.stage.handle != windows.InvalidHandle || guard.anchor.handle != windows.InvalidHandle || len(guard.ancestors) != 0 {
+		_ = windows.CloseHandle(reader)
+		t.Fatal("persistent cleanup failure leaked retained Windows directory handles")
+	}
+	if fileGuard == nil || fileGuard.handle != windows.InvalidHandle {
+		_ = windows.CloseHandle(reader)
+		t.Fatal("persistent cleanup failure leaked a retained Windows file handle")
+	}
+	if err := windows.CloseHandle(reader); err != nil {
 		t.Fatal(err)
 	}
-	if err := stage.cleanup(); err != nil {
-		t.Fatalf("cleanup after file reader closed: %v", err)
+	if err := os.Remove(stagedPath); err != nil {
+		t.Fatalf("manually remove abandoned staged file after reader closed: %v", err)
 	}
+	if err := os.Remove(stageDir); err != nil {
+		t.Fatalf("manually remove abandoned stage after reader closed: %v", err)
+	}
+	if err := os.Remove(anchor); err != nil {
+		t.Fatalf("manually remove abandoned anchor after reader closed: %v", err)
+	}
+}
+
+func TestWindowsPromptResourceFileReplacementWindowRetainsRetryableIdentity(t *testing.T) {
+	params := runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{{
+		Type:     "image",
+		MimeType: "image/png",
+		Data:     base64.StdEncoding.EncodeToString([]byte("original image")),
+	}}}
+	prepared, stage, err := preparePromptResources(context.Background(), params, PromptResourceLimits{}, t.TempDir(), nil)
+	if err != nil || stage == nil {
+		t.Fatalf("prepare result stage=%#v err=%v", stage, err)
+	}
+	guard := stage.guard.(*windowsPromptResourceStageGuard)
+	path := prepared.Prompt[0].PreparedFile.Path
+	moved := path + ".original"
+	target := guard.files[windowsPromptResourceNameKey(filepath.Base(path))]
+	swapped := false
+	cleaned := false
+	defer func() {
+		if cleaned {
+			return
+		}
+		if swapped {
+			_ = os.Remove(path)
+			_ = os.Rename(moved, path)
+		}
+		_ = stage.cleanup()
+	}()
+
+	removed, err := deleteExactWindowsPromptResourceFileWithTransition(guard.stage.handle, target, func() error {
+		if err := os.Rename(path, moved); err != nil {
+			return err
+		}
+		swapped = true
+		return os.WriteFile(path, []byte("replacement"), 0o600)
+	})
+	if err == nil || removed {
+		t.Fatalf("replacement-window cleanup = removed %v, error %v; want retained failure", removed, err)
+	}
+	if target.handle == windows.InvalidHandle {
+		t.Fatal("replacement-window cleanup discarded the exact file identity handle")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, path); err != nil {
+		t.Fatal(err)
+	}
+	swapped = false
+	if err := stage.verify(); err != nil {
+		t.Fatalf("verify restored exact file identity: %v", err)
+	}
+	if err := stage.cleanup(); err != nil {
+		t.Fatalf("retry cleanup after restoring exact file path: %v", err)
+	}
+	cleaned = true
+}
+
+func TestWindowsPromptResourceDirectoryReplacementWindowRetainsRetryableIdentity(t *testing.T) {
+	parent, err := preparePromptResourceParent(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stagePath, rawGuard, err := createPromptResourceStage(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := rawGuard.(*windowsPromptResourceStageGuard)
+	if err := guard.Secure(); err != nil {
+		t.Fatal(err)
+	}
+	moved := stagePath + ".original"
+	swapped := false
+	cleaned := false
+	defer func() {
+		if cleaned {
+			return
+		}
+		if swapped {
+			_ = os.Remove(stagePath)
+			_ = os.Rename(moved, stagePath)
+		}
+		_ = guard.Cleanup(nil)
+	}()
+
+	removed, err := deleteExactWindowsPromptResourceDirectoryWithTransition(guard.anchor.handle, &guard.stage, func() error {
+		if err := os.Rename(stagePath, moved); err != nil {
+			return err
+		}
+		swapped = true
+		return os.Mkdir(stagePath, 0o700)
+	})
+	if err == nil || removed {
+		t.Fatalf("replacement-window cleanup = removed %v, error %v; want retained failure", removed, err)
+	}
+	if guard.stage.handle == windows.InvalidHandle || guard.stageRemoved {
+		t.Fatal("replacement-window cleanup advanced directory state or discarded its exact identity handle")
+	}
+	if err := os.Remove(stagePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, stagePath); err != nil {
+		t.Fatal(err)
+	}
+	swapped = false
+	if err := guard.Verify(); err != nil {
+		t.Fatalf("verify restored exact directory identity: %v", err)
+	}
+	if err := guard.Cleanup(nil); err != nil {
+		t.Fatalf("retry cleanup after restoring exact directory path: %v", err)
+	}
+	cleaned = true
 }
 
 func TestWindowsPromptResourceCleanupRefusesUnexpectedStageEntry(t *testing.T) {
@@ -250,15 +461,13 @@ func TestWindowsPromptResourceCleanupRefusesUnexpectedStageEntry(t *testing.T) {
 	if err != nil || stage == nil {
 		t.Fatalf("prepare result stage=%#v err=%v", stage, err)
 	}
+	guard := stage.guard.(*windowsPromptResourceStageGuard)
 	extra := filepath.Join(stage.dir, "unexpected.bin")
 	if err := os.WriteFile(extra, []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := stage.cleanup(); err == nil {
+	if err := guard.Cleanup(nil); err == nil {
 		t.Fatal("cleanup removed a stage containing an unretained entry")
-	}
-	if stage.guard == nil {
-		t.Fatal("failed cleanup discarded exact stage guards")
 	}
 	if err := os.Remove(extra); err != nil {
 		t.Fatal(err)
@@ -270,7 +479,7 @@ func TestWindowsPromptResourceCleanupRefusesUnexpectedStageEntry(t *testing.T) {
 
 func TestWindowsPromptResourceAncestorRejectsUntrustedDirectDeleteGrant(t *testing.T) {
 	dir := t.TempDir()
-	handle, err := openWindowsPromptResourceDirectory(dir, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.WRITE_DAC)
+	handle, err := openWindowsPromptResourceDirectory(dir, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER)
 	if err != nil {
 		t.Fatal(err)
 	}

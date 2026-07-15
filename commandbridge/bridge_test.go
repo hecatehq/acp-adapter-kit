@@ -123,6 +123,7 @@ func TestBridgeRejectsEmptyCustomSessionID(t *testing.T) {
 }
 
 func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
+	workdir := t.TempDir()
 	var saw commandbridge.Session
 	var sawPrompt string
 	bridge := commandbridge.New(commandbridge.Spec{
@@ -152,7 +153,7 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 				!strings.Contains(spec.Args[2], `"kind":"embedded_text"`) ||
 				!strings.Contains(spec.Args[2], `"name":"note.md"`) ||
 				!strings.Contains(spec.Args[2], `"text":"from resource"`) ||
-				spec.Dir != "/tmp/work" {
+				spec.Dir != workdir {
 				t.Fatalf("process spec = %#v, want model + prompt + cwd", spec)
 			}
 			return adapterprocess.Result{Stdout: []byte("assistant answer\n")}, nil
@@ -160,7 +161,7 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 	})
 	client := acptest.NewClient(t, server(bridge))
 
-	created := client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+	created := client.Request("session/new", map[string]any{"cwd": workdir})
 	var session struct {
 		SessionID     string `json:"sessionId"`
 		ConfigOptions []struct {
@@ -224,7 +225,7 @@ func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 		start.Update.Status != "in_progress" ||
 		start.Update.RawInput["command"] != "agent" ||
 		start.Update.RawInput["arguments"] != adapterprocess.RedactedValue ||
-		start.Update.RawInput["cwd"] != "/tmp/work" {
+		start.Update.RawInput["cwd"] != workdir {
 		t.Fatalf("tool start = %#v, want prompt command metadata", start)
 	}
 

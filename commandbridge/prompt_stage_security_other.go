@@ -26,6 +26,13 @@ type unixPromptResourceStageGuard struct {
 	anchorRemoved bool
 }
 
+func (g *unixPromptResourceStageGuard) SetExpectedFiles(count int) error {
+	if g == nil || count < 0 {
+		return errors.New("invalid expected prompt resource file count")
+	}
+	return nil
+}
+
 func preparePromptResourceParent(raw string) (string, error) {
 	if raw == "" {
 		raw = os.TempDir()
@@ -388,17 +395,30 @@ func (g *unixPromptResourceStageGuard) close() error {
 		result = errors.Join(result, g.anchor.file.Close())
 		g.anchor.file = nil
 	}
-	closeUnixPromptResourceHandles(g.ancestors)
+	result = errors.Join(result, closeUnixPromptResourceHandlesWithError(g.ancestors))
 	g.ancestors = nil
 	return result
 }
 
+func (g *unixPromptResourceStageGuard) Abandon() error {
+	if g == nil {
+		return nil
+	}
+	return g.close()
+}
+
 func closeUnixPromptResourceHandles(handles []unixPromptResourcePathHandle) {
+	_ = closeUnixPromptResourceHandlesWithError(handles)
+}
+
+func closeUnixPromptResourceHandlesWithError(handles []unixPromptResourcePathHandle) error {
+	var result error
 	for index := len(handles) - 1; index >= 0; index-- {
 		if handles[index].file != nil {
-			_ = handles[index].file.Close()
+			result = errors.Join(result, handles[index].file.Close())
 		}
 	}
+	return result
 }
 
 func securePromptResourceStage(path string) error {

@@ -14,6 +14,8 @@ import (
 
 const maxMessageBytes = 1024 * 1024
 
+const outboundWriteQueueSize = 16
+
 type RPCError = sdk.RequestError
 
 type AdapterInfo struct {
@@ -92,9 +94,10 @@ func (c *MethodContext) Request(method string, params any) (json.RawMessage, *RP
 
 // RequestContext sends a request to the connected ACP client and waits for its
 // response or for ctx to be cancelled. A cancelled request is abandoned and a
-// best-effort $/cancel_request notification is sent to the client. A response
-// that arrives later is discarded instead of being retained for a future
-// outbound request.
+// best-effort $/cancel_request notification is queued for the client without
+// delaying cancellation; it is dropped if the bounded writer queue is full. A
+// response that arrives later is discarded instead of being retained for a
+// future outbound request.
 func (c *MethodContext) RequestContext(ctx context.Context, method string, params any) (json.RawMessage, *RPCError, error) {
 	if c == nil || c.conn == nil {
 		return nil, nil, errors.New("method context is not connected")
@@ -126,7 +129,7 @@ func (c *MethodContext) RequestContext(ctx context.Context, method string, param
 		return append(json.RawMessage(nil), result.result...), result.rpcErr, nil
 	case <-ctx.Done():
 		c.conn.abandonRequest(id)
-		_ = c.conn.write(serverNotification{
+		c.conn.tryWrite(serverNotification{
 			JSONRPC: "2.0",
 			Method:  "$/cancel_request",
 			Params:  cancelRequestParams{RequestID: id},
@@ -202,12 +205,13 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxMessageBytes)
 	conn := &connection{
-		scanner:   scanner,
-		encoder:   json.NewEncoder(output),
-		pending:   map[string]chan clientResponse{},
-		queued:    map[string]struct{}{},
-		active:    map[string]context.CancelFunc{},
-		cancelled: map[string]struct{}{},
+		scanner:          scanner,
+		encoder:          json.NewEncoder(output),
+		bestEffortWrites: make(chan any, outboundWriteQueueSize),
+		pending:          map[string]chan clientResponse{},
+		queued:           map[string]struct{}{},
+		active:           map[string]context.CancelFunc{},
+		cancelled:        map[string]struct{}{},
 	}
 	handlerErr := make(chan error, 1)
 	sendHandlerErr := func(err error) {
@@ -532,17 +536,19 @@ func sessionCapabilitiesFromInfo(info AdapterInfo) *sessionCapabilities {
 }
 
 type connection struct {
-	scanner   *bufio.Scanner
-	encoder   *json.Encoder
-	writeMu   sync.Mutex
-	requestMu sync.Mutex
-	nextID    int64
-	pending   map[string]chan clientResponse
-	queued    map[string]struct{}
-	active    map[string]context.CancelFunc
-	cancelled map[string]struct{}
-	closed    bool
-	closeErr  error
+	scanner          *bufio.Scanner
+	encoder          *json.Encoder
+	writeMu          sync.Mutex
+	bestEffortOnce   sync.Once
+	bestEffortWrites chan any
+	requestMu        sync.Mutex
+	nextID           int64
+	pending          map[string]chan clientResponse
+	queued           map[string]struct{}
+	active           map[string]context.CancelFunc
+	cancelled        map[string]struct{}
+	closed           bool
+	closeErr         error
 }
 
 type clientResponse struct {
@@ -622,7 +628,41 @@ func (c *connection) readMessage() (message, bool, error) {
 func (c *connection) write(value any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.initBestEffortWrites()
+	for drained := 0; drained < outboundWriteQueueSize; drained++ {
+		select {
+		case queued := <-c.bestEffortWrites:
+			if err := c.encoder.Encode(queued); err != nil {
+				return err
+			}
+		default:
+			return c.encoder.Encode(value)
+		}
+	}
 	return c.encoder.Encode(value)
+}
+
+func (c *connection) tryWrite(value any) {
+	c.initBestEffortWrites()
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+	// Once input closes, no peer remains to consume a best-effort notification.
+	// Dropping it also prevents shutdown from waiting on an abandoned output.
+	if c.closed {
+		return
+	}
+	select {
+	case c.bestEffortWrites <- value:
+	default:
+	}
+}
+
+func (c *connection) initBestEffortWrites() {
+	c.bestEffortOnce.Do(func() {
+		if c.bestEffortWrites == nil {
+			c.bestEffortWrites = make(chan any, outboundWriteQueueSize)
+		}
+	})
 }
 
 func (c *connection) registerRequest() (json.RawMessage, <-chan clientResponse, error) {

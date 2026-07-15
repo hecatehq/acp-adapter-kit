@@ -514,6 +514,10 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 		if errors.As(err, &cleanupErr) {
 			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource cleanup failed", Data: cleanupErr.Error()}
 		}
+		var stagingErr *promptResourceStagingError
+		if errors.As(err, &stagingErr) {
+			return nil, &acp.RPCError{Code: -32000, Message: "prompt resource staging failed", Data: stagingErr.Error()}
+		}
 		if runCtx.Err() != nil {
 			return runtimeacp.PromptResult{StopReason: runtimeacp.StopReasonCancelled}, nil
 		}

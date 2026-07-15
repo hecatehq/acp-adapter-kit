@@ -446,6 +446,19 @@ func TestPromptCancelWhileAwaitingRuntimeChildRequest(t *testing.T) {
 	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess-bridge"}}`); err != nil {
 		t.Fatalf("write cancel: %v", err)
 	}
+	cancelRequest := readBridgeResponseLine(t, reader)
+	if cancelRequest.Method != "$/cancel_request" {
+		t.Fatalf("post-cancel method = %q, want $/cancel_request before prompt response", cancelRequest.Method)
+	}
+	var cancelParams struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(cancelRequest.Params, &cancelParams); err != nil {
+		t.Fatalf("decode cancel request params: %v", err)
+	}
+	if string(cancelParams.RequestID) != string(childRequest.ID) {
+		t.Fatalf("cancel request id = %s, want child id %s", cancelParams.RequestID, childRequest.ID)
+	}
 	promptResponse := readBridgeResponseLine(t, reader)
 	var result struct {
 		StopReason string `json:"stopReason"`

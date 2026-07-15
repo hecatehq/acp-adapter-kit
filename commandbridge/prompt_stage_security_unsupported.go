@@ -6,6 +6,10 @@ import "errors"
 
 type unsupportedPromptResourceStageGuard struct{}
 
+func (*unsupportedPromptResourceStageGuard) SetExpectedFiles(int) error {
+	return errors.New("secure rich prompt input staging is unsupported on this platform")
+}
+
 func createPromptResourceStage(string) (string, string, promptResourceStageGuard, error) {
 	return "", "", nil, errors.New("secure rich prompt input staging is unsupported on this platform")
 }
@@ -37,6 +41,8 @@ func (*unsupportedPromptResourceStageGuard) Seal() error {
 func (*unsupportedPromptResourceStageGuard) Cleanup(func(string) error) error {
 	return errors.New("secure rich prompt input staging is unsupported on this platform")
 }
+
+func (*unsupportedPromptResourceStageGuard) Abandon() error { return nil }
 
 func securePromptResourceStage(string) error {
 	return errors.New("secure rich prompt input staging is unsupported on this platform")

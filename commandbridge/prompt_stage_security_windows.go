@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"unicode/utf16"
 	"unsafe"
@@ -25,11 +26,12 @@ type windowsPromptResourcePathHandle struct {
 }
 
 type windowsPromptResourceStageGuard struct {
-	ancestors    []windowsPromptResourcePathHandle
-	anchor       windowsPromptResourcePathHandle
-	stage        windowsPromptResourcePathHandle
-	files        map[string]*windowsPromptResourceFileHandle
-	stageRemoved bool
+	ancestors     []windowsPromptResourcePathHandle
+	anchor        windowsPromptResourcePathHandle
+	stage         windowsPromptResourcePathHandle
+	files         map[string]*windowsPromptResourceFileHandle
+	expectedFiles int
+	stageRemoved  bool
 }
 
 type windowsPromptResourceFileHandle struct {
@@ -211,11 +213,13 @@ func createPromptResourceStage(parent string) (string, string, promptResourceSta
 	}
 	if err != nil {
 		_, cleanupErr := deleteExactWindowsPromptResourceDirectory(ancestors[len(ancestors)-1].handle, &anchorHandle)
+		closeWindowsPromptResourcePathHandle(&anchorHandle)
 		return "", "", nil, errors.Join(fmt.Errorf("verify protected prompt resource anchor at creation: %w", err), cleanupErr)
 	}
 	stage, err := createPrivateWindowsPromptResourceDirectory(anchor, "inputs-", descriptor)
 	if err != nil {
 		_, cleanupErr := deleteExactWindowsPromptResourceDirectory(ancestors[len(ancestors)-1].handle, &anchorHandle)
+		closeWindowsPromptResourcePathHandle(&anchorHandle)
 		return "", "", nil, errors.Join(err, cleanupErr)
 	}
 	stageHandle, err := openWindowsPromptResourceDirectory(stage, windowsPromptResourceStageAccess)
@@ -226,9 +230,11 @@ func createPromptResourceStage(parent string) (string, string, promptResourceSta
 	if err := verifyPromptResourceStageACLHandle(stageHandle.handle, allowed); err != nil {
 		_, stageCleanupErr := deleteExactWindowsPromptResourceDirectory(anchorHandle.handle, &stageHandle)
 		_, anchorCleanupErr := deleteExactWindowsPromptResourceDirectory(ancestors[len(ancestors)-1].handle, &anchorHandle)
+		closeWindowsPromptResourcePathHandle(&stageHandle)
+		closeWindowsPromptResourcePathHandle(&anchorHandle)
 		return "", "", nil, errors.Join(errors.New("verify protected prompt resource stage at creation"), err, stageCleanupErr, anchorCleanupErr)
 	}
-	guard := &windowsPromptResourceStageGuard{ancestors: ancestors, anchor: anchorHandle, stage: stageHandle, files: map[string]*windowsPromptResourceFileHandle{}}
+	guard := &windowsPromptResourceStageGuard{ancestors: ancestors, anchor: anchorHandle, stage: stageHandle, files: map[string]*windowsPromptResourceFileHandle{}, expectedFiles: DefaultMaxPromptResourceFiles}
 	closeOnError = false
 	return anchor, stage, guard, nil
 }
@@ -238,11 +244,23 @@ func privateWindowsPromptResourceSecurityDescriptor() (*windows.SECURITY_DESCRIP
 	if err != nil {
 		return nil, err
 	}
+	return privateWindowsPromptResourceSecurityDescriptorFor(allowed)
+}
+
+func privateWindowsPromptResourceSecurityDescriptorFor(allowed []*windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
 	if len(allowed) == 0 {
 		return nil, errors.New("prompt resource owner is unavailable")
 	}
-	user := allowed[0].String()
-	return windows.SecurityDescriptorFromString("O:" + user + "D:P(A;OICI;GA;;;" + user + ")(A;OICI;GA;;;SY)")
+	var sddl strings.Builder
+	sddl.WriteString("O:")
+	sddl.WriteString(allowed[0].String())
+	sddl.WriteString("D:P")
+	for _, sid := range allowed {
+		sddl.WriteString("(A;OICI;GA;;;")
+		sddl.WriteString(sid.String())
+		sddl.WriteByte(')')
+	}
+	return windows.SecurityDescriptorFromString(sddl.String())
 }
 
 func createPrivateWindowsPromptResourceDirectory(parent, prefix string, descriptor *windows.SECURITY_DESCRIPTOR) (string, error) {
@@ -290,7 +308,18 @@ func newPromptResourceStageGuard(anchor, stage string) (promptResourceStageGuard
 		closeWindowsPromptResourceHandles(ancestors)
 		return nil, err
 	}
-	return &windowsPromptResourceStageGuard{ancestors: ancestors, anchor: anchorHandle, stage: stageHandle, files: map[string]*windowsPromptResourceFileHandle{}}, nil
+	return &windowsPromptResourceStageGuard{ancestors: ancestors, anchor: anchorHandle, stage: stageHandle, files: map[string]*windowsPromptResourceFileHandle{}, expectedFiles: DefaultMaxPromptResourceFiles}, nil
+}
+
+func (g *windowsPromptResourceStageGuard) SetExpectedFiles(count int) error {
+	if g == nil || count < 0 {
+		return errors.New("invalid expected prompt resource file count")
+	}
+	if len(g.files) != 0 {
+		return errors.New("expected prompt resource file count cannot change after staging begins")
+	}
+	g.expectedFiles = count
+	return nil
 }
 
 func openWindowsPromptResourceDirectory(path string, access uint32) (windowsPromptResourcePathHandle, error) {
@@ -427,9 +456,12 @@ func windowsPromptResourceNameKey(name string) string {
 	return strings.ToLower(name)
 }
 
-func listWindowsPromptResourceStageEntries(stage windows.Handle) ([]string, error) {
+func listWindowsPromptResourceStageEntries(stage windows.Handle, expectedFiles int) ([]string, error) {
 	if stage == windows.InvalidHandle {
 		return nil, errors.New("prompt resource stage handle is unavailable")
+	}
+	if expectedFiles < 0 {
+		return nil, errors.New("invalid expected prompt resource file count")
 	}
 	buffer := make([]byte, 64*1024)
 	class := uint32(windows.FileIdBothDirectoryRestartInfo)
@@ -449,19 +481,25 @@ func listWindowsPromptResourceStageEntries(stage windows.Handle) ([]string, erro
 			return nil, err
 		}
 		class = windows.FileIdBothDirectoryInfo
-		batch, err := decodeWindowsPromptResourceDirectoryEntries(buffer)
+		batch, err := decodeWindowsPromptResourceDirectoryEntries(buffer, expectedFiles-len(names))
 		if err != nil {
 			return nil, err
 		}
 		names = append(names, batch...)
-		if len(names) > DefaultMaxPromptResourceFiles {
+		if len(names) > expectedFiles {
 			return nil, errors.New("prompt resource stage contains unexpected entries")
 		}
 	}
 }
 
-func decodeWindowsPromptResourceDirectoryEntries(buffer []byte) ([]string, error) {
-	const maxPromptResourceDirectoryEntries = DefaultMaxPromptResourceFiles + 2
+func decodeWindowsPromptResourceDirectoryEntries(buffer []byte, remainingExpected int) ([]string, error) {
+	if remainingExpected < 0 {
+		return nil, errors.New("prompt resource stage contains unexpected entries")
+	}
+	// Decode at most one entry beyond the expected count so an attacker cannot
+	// turn directory verification into unbounded work while extras still fail
+	// closed.
+	maxPromptResourceDirectoryEntries := remainingExpected + 1
 	entryHeaderBytes := int(unsafe.Offsetof(windowsFileIDBothDirectoryInfo{}.FileName))
 	var names []string
 	for offset := 0; ; {
@@ -549,33 +587,34 @@ func securePromptResourceDirectoryHandle(handle windows.Handle) error {
 	if err != nil {
 		return fmt.Errorf("resolve prompt stage principals: %w", err)
 	}
-	entries := make([]windows.EXPLICIT_ACCESS, 0, len(allowed))
-	for _, sid := range allowed {
-		entries = append(entries, windows.EXPLICIT_ACCESS{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.SET_ACCESS,
-			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(sid),
-			},
-		})
-	}
-	acl, err := windows.ACLFromEntries(entries, nil)
+	descriptor, err := privateWindowsPromptResourceSecurityDescriptorFor(allowed)
 	if err != nil {
-		return fmt.Errorf("build prompt stage ACL: %w", err)
+		return fmt.Errorf("build prompt stage security descriptor: %w", err)
 	}
-	if err := windows.SetSecurityInfo(
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		return fmt.Errorf("read prompt stage owner: %w", err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return fmt.Errorf("read prompt stage DACL: %w", err)
+	}
+	if owner == nil || dacl == nil {
+		return errors.New("prompt stage security descriptor is incomplete")
+	}
+	setErr := windows.SetSecurityInfo(
 		handle,
 		windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		allowed[0],
+		owner,
 		nil,
-		acl,
+		dacl,
 		nil,
-	); err != nil {
-		return fmt.Errorf("apply prompt stage owner and ACL: %w", err)
+	)
+	// owner and dacl point into descriptor-owned memory.
+	runtime.KeepAlive(descriptor)
+	if setErr != nil {
+		return fmt.Errorf("apply prompt stage owner and ACL: %w", setErr)
 	}
 	return verifyPromptResourceStageACLHandle(handle, allowed)
 }
@@ -604,7 +643,7 @@ func (g *windowsPromptResourceStageGuard) verifyFiles() error {
 	if g == nil || g.stage.handle == windows.InvalidHandle {
 		return errors.New("prompt resource stage handle is unavailable")
 	}
-	entries, err := listWindowsPromptResourceStageEntries(g.stage.handle)
+	entries, err := listWindowsPromptResourceStageEntries(g.stage.handle, g.expectedFiles)
 	if err != nil {
 		return err
 	}
@@ -836,11 +875,39 @@ func (g *windowsPromptResourceStageGuard) Cleanup(beforeRemove func(string) erro
 	return nil
 }
 
+func (g *windowsPromptResourceStageGuard) Abandon() error {
+	if g == nil {
+		return nil
+	}
+	var result error
+	for key, target := range g.files {
+		if target != nil && target.handle != windows.InvalidHandle {
+			result = errors.Join(result, windows.CloseHandle(target.handle))
+			target.handle = windows.InvalidHandle
+		}
+		delete(g.files, key)
+	}
+	for _, target := range []*windowsPromptResourcePathHandle{&g.stage, &g.anchor} {
+		if target.handle != windows.InvalidHandle {
+			result = errors.Join(result, windows.CloseHandle(target.handle))
+			target.handle = windows.InvalidHandle
+		}
+	}
+	for index := len(g.ancestors) - 1; index >= 0; index-- {
+		if g.ancestors[index].handle != windows.InvalidHandle {
+			result = errors.Join(result, windows.CloseHandle(g.ancestors[index].handle))
+			g.ancestors[index].handle = windows.InvalidHandle
+		}
+	}
+	g.ancestors = nil
+	return result
+}
+
 func (g *windowsPromptResourceStageGuard) removeFiles() error {
 	if err := g.verifyFiles(); err != nil {
 		return err
 	}
-	entries, err := listWindowsPromptResourceStageEntries(g.stage.handle)
+	entries, err := listWindowsPromptResourceStageEntries(g.stage.handle, g.expectedFiles)
 	if err != nil {
 		return err
 	}
@@ -858,7 +925,7 @@ func (g *windowsPromptResourceStageGuard) removeFiles() error {
 			return err
 		}
 	}
-	remaining, err := listWindowsPromptResourceStageEntries(g.stage.handle)
+	remaining, err := listWindowsPromptResourceStageEntries(g.stage.handle, g.expectedFiles)
 	if err != nil {
 		return err
 	}
@@ -869,39 +936,63 @@ func (g *windowsPromptResourceStageGuard) removeFiles() error {
 }
 
 func deleteExactWindowsPromptResourceFile(stage windows.Handle, target *windowsPromptResourceFileHandle) (bool, error) {
+	return deleteExactWindowsPromptResourceFileWithTransition(stage, target, nil)
+}
+
+func deleteExactWindowsPromptResourceFileWithTransition(stage windows.Handle, target *windowsPromptResourceFileHandle, afterHandoff func() error) (bool, error) {
 	if err := verifyWindowsPromptResourceFileHandle(stage, target); err != nil {
 		return false, err
 	}
+	handoff, err := openWindowsPromptResourceFileRelative(stage, target.name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windowsPromptResourceShareAll)
+	if err != nil {
+		return false, fmt.Errorf("open staged resource identity handoff: %w", err)
+	}
+	if !samePromptResourceFileID(target.info, handoff.info) {
+		_ = windows.CloseHandle(handoff.handle)
+		return false, errors.New("staged resource path changed before cleanup handoff")
+	}
+	if err := verifyPrivatePromptResourceFileHandle(handoff.handle); err != nil {
+		_ = windows.CloseHandle(handoff.handle)
+		return false, err
+	}
 	if err := windows.CloseHandle(target.handle); err != nil {
+		_ = windows.CloseHandle(handoff.handle)
 		return false, fmt.Errorf("close retained staged resource handle: %w", err)
 	}
-	target.handle = windows.InvalidHandle
+	target.handle = handoff.handle
+	if afterHandoff != nil {
+		if err := afterHandoff(); err != nil {
+			restoreErr := restoreWindowsPromptResourceFileNoDeleteGuard(stage, target)
+			return false, errors.Join(err, restoreErr)
+		}
+	}
 	deleteHandle, err := openWindowsPromptResourceFileRelative(stage, target.name, windows.DELETE|windows.FILE_READ_ATTRIBUTES, windowsPromptResourceShareNoDelete)
 	if err != nil {
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return true, nil
-		}
-		restoreErr := restoreWindowsPromptResourceFileHandle(stage, target)
+		restoreErr := restoreWindowsPromptResourceFileNoDeleteGuard(stage, target)
 		return false, errors.Join(err, restoreErr)
 	}
 	if !samePromptResourceFileID(target.info, deleteHandle.info) {
-		_ = windows.CloseHandle(deleteHandle.handle)
-		return true, errors.New("staged resource path was replaced before exact cleanup")
+		closeErr := windows.CloseHandle(deleteHandle.handle)
+		return false, errors.Join(errors.New("staged resource path was replaced before exact cleanup"), closeErr)
 	}
 	if err := markWindowsPromptResourceHandleForDeletion(deleteHandle.handle); err != nil {
-		_ = windows.CloseHandle(deleteHandle.handle)
-		restoreErr := restoreWindowsPromptResourceFileHandle(stage, target)
-		return false, errors.Join(err, restoreErr)
+		closeErr := windows.CloseHandle(deleteHandle.handle)
+		restoreErr := restoreWindowsPromptResourceFileNoDeleteGuard(stage, target)
+		return false, errors.Join(err, closeErr, restoreErr)
 	}
 	if err := windows.CloseHandle(deleteHandle.handle); err != nil {
 		return false, fmt.Errorf("close exact staged resource deletion handle: %w", err)
 	}
+	if err := windows.CloseHandle(target.handle); err != nil {
+		return false, fmt.Errorf("close staged resource identity handoff: %w", err)
+	}
+	target.handle = windows.InvalidHandle
 	return true, nil
 }
 
-func restoreWindowsPromptResourceFileHandle(stage windows.Handle, target *windowsPromptResourceFileHandle) error {
-	if target == nil || target.handle != windows.InvalidHandle {
-		return errors.New("staged resource handle is not ready for restoration")
+func restoreWindowsPromptResourceFileNoDeleteGuard(stage windows.Handle, target *windowsPromptResourceFileHandle) error {
+	if target == nil || target.handle == windows.InvalidHandle {
+		return errors.New("staged resource identity handoff is unavailable")
 	}
 	restored, err := openWindowsPromptResourceFileRelative(stage, target.name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windowsPromptResourceShareNoDelete)
 	if err != nil {
@@ -915,11 +1006,19 @@ func restoreWindowsPromptResourceFileHandle(stage windows.Handle, target *window
 		_ = windows.CloseHandle(restored.handle)
 		return err
 	}
+	if err := windows.CloseHandle(target.handle); err != nil {
+		_ = windows.CloseHandle(restored.handle)
+		return fmt.Errorf("close staged resource identity handoff: %w", err)
+	}
 	target.handle = restored.handle
 	return nil
 }
 
 func deleteExactWindowsPromptResourceDirectory(parent windows.Handle, target *windowsPromptResourcePathHandle) (bool, error) {
+	return deleteExactWindowsPromptResourceDirectoryWithTransition(parent, target, nil)
+}
+
+func deleteExactWindowsPromptResourceDirectoryWithTransition(parent windows.Handle, target *windowsPromptResourcePathHandle, afterHandoff func() error) (bool, error) {
 	if parent == windows.InvalidHandle || target == nil || target.handle == windows.InvalidHandle {
 		return false, errors.New("prompt resource directory handle is unavailable")
 	}
@@ -927,36 +1026,52 @@ func deleteExactWindowsPromptResourceDirectory(parent windows.Handle, target *wi
 	if err := verifyWindowsPromptResourcePathHandle(original); err != nil {
 		return false, err
 	}
+	handoff, err := openWindowsPromptResourceDirectoryRelative(parent, original.path, original.access, windowsPromptResourceShareAll)
+	if err != nil {
+		return false, fmt.Errorf("open prompt resource directory identity handoff: %w", err)
+	}
+	if !samePromptResourceFileID(original.info, handoff.info) || original.security == "" || handoff.security != original.security {
+		_ = windows.CloseHandle(handoff.handle)
+		return false, errors.New("prompt resource directory changed before cleanup handoff")
+	}
 	if err := windows.CloseHandle(original.handle); err != nil {
+		_ = windows.CloseHandle(handoff.handle)
 		return false, fmt.Errorf("close retained prompt resource directory handle: %w", err)
 	}
-	target.handle = windows.InvalidHandle
+	*target = handoff
+	if afterHandoff != nil {
+		if err := afterHandoff(); err != nil {
+			restoreErr := restoreWindowsPromptResourceDirectoryNoDeleteGuard(parent, target)
+			return false, errors.Join(err, restoreErr)
+		}
+	}
 	deleteHandle, err := openWindowsPromptResourceDirectoryRelative(parent, original.path, original.access|windows.DELETE, windowsPromptResourceShareNoDelete)
 	if err != nil {
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return true, nil
-		}
-		restoreErr := restoreWindowsPromptResourceDirectoryHandle(parent, target)
+		restoreErr := restoreWindowsPromptResourceDirectoryNoDeleteGuard(parent, target)
 		return false, errors.Join(err, restoreErr)
 	}
 	if !samePromptResourceFileID(original.info, deleteHandle.info) || original.security == "" || deleteHandle.security != original.security {
-		_ = windows.CloseHandle(deleteHandle.handle)
-		return true, errors.New("a replacement appeared before deleting the exact prompt resource directory")
+		closeErr := windows.CloseHandle(deleteHandle.handle)
+		return false, errors.Join(errors.New("a replacement appeared before deleting the exact prompt resource directory"), closeErr)
 	}
 	if err := markWindowsPromptResourceHandleForDeletion(deleteHandle.handle); err != nil {
-		_ = windows.CloseHandle(deleteHandle.handle)
-		restoreErr := restoreWindowsPromptResourceDirectoryHandle(parent, target)
-		return false, errors.Join(err, restoreErr)
+		closeErr := windows.CloseHandle(deleteHandle.handle)
+		restoreErr := restoreWindowsPromptResourceDirectoryNoDeleteGuard(parent, target)
+		return false, errors.Join(err, closeErr, restoreErr)
 	}
 	if err := windows.CloseHandle(deleteHandle.handle); err != nil {
 		return false, fmt.Errorf("close exact prompt resource directory deletion handle: %w", err)
 	}
+	if err := windows.CloseHandle(target.handle); err != nil {
+		return false, fmt.Errorf("close prompt resource directory identity handoff: %w", err)
+	}
+	target.handle = windows.InvalidHandle
 	return true, nil
 }
 
-func restoreWindowsPromptResourceDirectoryHandle(parent windows.Handle, target *windowsPromptResourcePathHandle) error {
-	if target == nil || target.handle != windows.InvalidHandle {
-		return errors.New("prompt resource directory handle is not ready for restoration")
+func restoreWindowsPromptResourceDirectoryNoDeleteGuard(parent windows.Handle, target *windowsPromptResourcePathHandle) error {
+	if target == nil || target.handle == windows.InvalidHandle {
+		return errors.New("prompt resource directory identity handoff is unavailable")
 	}
 	restored, err := openWindowsPromptResourceDirectoryRelative(parent, target.path, target.access, windowsPromptResourceShareNoDelete)
 	if err != nil {
@@ -965,6 +1080,10 @@ func restoreWindowsPromptResourceDirectoryHandle(parent windows.Handle, target *
 	if !samePromptResourceFileID(target.info, restored.info) || target.security == "" || restored.security != target.security {
 		_ = windows.CloseHandle(restored.handle)
 		return errors.New("prompt resource directory was replaced while restoring cleanup protection")
+	}
+	if err := windows.CloseHandle(target.handle); err != nil {
+		_ = windows.CloseHandle(restored.handle)
+		return fmt.Errorf("close prompt resource directory identity handoff: %w", err)
 	}
 	*target = restored
 	return nil
@@ -987,6 +1106,13 @@ func closeWindowsPromptResourceHandles(handles []windowsPromptResourcePathHandle
 		if handles[index].handle != windows.InvalidHandle {
 			_ = windows.CloseHandle(handles[index].handle)
 		}
+	}
+}
+
+func closeWindowsPromptResourcePathHandle(target *windowsPromptResourcePathHandle) {
+	if target != nil && target.handle != windows.InvalidHandle {
+		_ = windows.CloseHandle(target.handle)
+		target.handle = windows.InvalidHandle
 	}
 }
 

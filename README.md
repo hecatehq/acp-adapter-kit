@@ -50,9 +50,9 @@ Adapters have two runtime integration paths:
   publishing `session_info_update` notifications when transcript metadata
   changes, translating structured command streams into ACP updates when a
   parser is configured, requesting ACP tool permissions from parsed stream
-  events before continuing (with cancellation abandoning and notifying the
-  pending request, then discarding any late client response), optionally
-  mapping provider-specific missing native
+  events before continuing (with cancellation abandoning the pending request,
+  best-effort notifying through a bounded writer queue, and discarding any late
+  client response), optionally mapping provider-specific missing native
   conversation failures to a typed `native_session_missing` prompt-error
   discriminator, and optionally prepending a bounded transcript prelude to
   later prompt commands. Prompt command arguments are redacted from ACP tool
@@ -120,13 +120,15 @@ fails closed when the filesystem cannot enforce either. Other platforms reject
 rich file preparation rather than relying on weaker filesystem semantics.
 
 The cloned `Session` passed to `BuildPrompt` contains the stage as one
-additional directory; persistent session state never does. The stage is
-removed after success, builder or process failure, and cancellation. Cleanup
-uses retained directory identities and deletes only exact stage entries; it
-does not recursively delete through a re-resolved stage path. Cleanup must
-succeed before prompt counts or transcript state are updated, and a cleanup
-failure changes the prompt result to an error while retaining identity guards
-for a safe retry. These controls limit inherited or untrusted-principal access
+additional directory; persistent session state never does. Exact stage cleanup
+is attempted after success, builder or process failure, and cancellation.
+Cleanup uses retained directory identities and deletes only exact stage
+entries; it does not recursively delete through a re-resolved stage path.
+Cleanup must succeed before prompt counts or transcript state are updated. The
+kit makes a bounded retry when exact cleanup fails; a persistent failure
+changes the prompt result to an error, closes every retained identity handle,
+and leaves any protected remnant for manual removal after the adapter process
+exits. These controls limit inherited or untrusted-principal access
 and accidental path replacement; they are not sandbox isolation from another
 process running as the adapter's OS user, which can inspect a discovered path
 or change owner-controlled modes and DACLs. Exact private paths and file URIs

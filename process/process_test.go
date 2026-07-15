@@ -429,13 +429,45 @@ func assertProcessHelperDidNotStart(t *testing.T, marker string) {
 }
 
 func TestMissingBinaryReturnsTypedError(t *testing.T) {
-	_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
-		Command: filepath.Join(t.TempDir(), "missing-binary"),
-		Dir:     t.TempDir(),
-	})
-	var missing *adapterprocess.CommandNotFoundError
-	if !errors.As(err, &missing) {
-		t.Fatalf("error = %T %[1]v, want CommandNotFoundError", err)
+	missingBinary := filepath.Join(t.TempDir(), "missing-binary")
+	workingDir := t.TempDir()
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "run",
+			run: func() error {
+				_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{Command: missingBinary, Dir: workingDir})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			run: func() error {
+				_, err := adapterprocess.RunStream(context.Background(), adapterprocess.Spec{Command: missingBinary, Dir: workingDir}, nil)
+				return err
+			},
+		},
+		{
+			name: "start",
+			run: func() error {
+				_, err := adapterprocess.Start(context.Background(), adapterprocess.StartSpec{Command: missingBinary, Dir: workingDir})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.run()
+			var missing *adapterprocess.CommandNotFoundError
+			if !errors.As(err, &missing) {
+				t.Fatalf("error = %T %[1]v, want CommandNotFoundError", err)
+			}
+			if missing.Command != missingBinary {
+				t.Fatalf("missing command = %q, want %q", missing.Command, missingBinary)
+			}
+		})
 	}
 }
 
