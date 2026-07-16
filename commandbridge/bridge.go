@@ -2,6 +2,8 @@ package commandbridge
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,8 +51,27 @@ type LogoutCommandBuilder func() (adapterprocess.Spec, error)
 
 type AuthRequiredDetector func(adapterprocess.Result, error) bool
 
+type PromptFailureKind uint8
+
+const (
+	PromptFailureUnknown PromptFailureKind = iota
+	PromptFailureNativeSessionMissing
+)
+
+// PromptFailureClassifier maps a provider-specific non-zero command exit to a
+// provider-neutral wire discriminator. The bridge invokes it only for a
+// process.ExitError; classifiers must additionally fail closed on partial or
+// truncated output and prove provider-specific identity/session invariants.
+// The bridge reports the classification without retrying or mutating session
+// state; the host remains responsible for deciding whether replacing native
+// state is safe for its persisted session.
+type PromptFailureClassifier func(Session, adapterprocess.Spec, adapterprocess.Result, error) PromptFailureKind
+
 type Spec struct {
-	Runner                 Runner
+	Runner Runner
+	// NewID overrides the default cryptographically random ACP session id.
+	// Custom generators must return a non-empty id that remains unique across
+	// adapter process restarts.
 	NewID                  func() string
 	LoadUnknownSessions    bool
 	AuthMethods            []acp.AuthMethod
@@ -62,6 +83,7 @@ type Spec struct {
 	BuildAuthenticate      AuthenticateCommandBuilder
 	BuildLogout            LogoutCommandBuilder
 	AuthRequired           AuthRequiredDetector
+	ClassifyPromptFailure  PromptFailureClassifier
 	NewStreamParser        func(Session, runtimeacp.PromptParams) StreamParser
 	Now                    func() time.Time
 }
@@ -232,7 +254,10 @@ func (b *Bridge) newSession(ctx *acp.MethodContext, params json.RawMessage) (any
 	if rpcErr := decodeParams(params, &req); rpcErr != nil {
 		return nil, rpcErr
 	}
-	id := b.newID()
+	id, err := b.newID()
+	if err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "session id generation failed", Data: err.Error()}
+	}
 	now := b.now()
 	state := &sessionState{Session: Session{
 		ID:                    id,
@@ -264,7 +289,10 @@ func (b *Bridge) forkSession(ctx *acp.MethodContext, params json.RawMessage) (an
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	id := b.newID()
+	id, err := b.newID()
+	if err != nil {
+		return nil, &acp.RPCError{Code: -32000, Message: "session id generation failed", Data: err.Error()}
+	}
 	now := b.now()
 	state := &sessionState{Session: Session{
 		ID:                    id,
@@ -440,7 +468,11 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		if b.authRequired(result, err) {
 			return nil, authRequired(commandErrorData(result, err))
 		}
-		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: commandErrorData(result, err)}
+		data := commandErrorData(result, err)
+		if kind := b.classifyPromptFailure(state.Session, command, result, err); kind != "" {
+			data["errorKind"] = kind
+		}
+		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
 	b.recordPromptSuccess(req.SessionID)
 	if info, ok := b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText); ok {
@@ -1075,11 +1107,19 @@ func (b *Bridge) cancel(sessionID string) bool {
 	return true
 }
 
-func (b *Bridge) newID() string {
+func (b *Bridge) newID() (string, error) {
 	if b.spec.NewID != nil {
-		return b.spec.NewID()
+		id := b.spec.NewID()
+		if strings.TrimSpace(id) == "" {
+			return "", errors.New("custom session id is empty")
+		}
+		return id, nil
 	}
-	return fmt.Sprintf("session-%d", b.nextID.Add(1))
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", fmt.Errorf("read secure session id entropy: %w", err)
+	}
+	return "session-" + hex.EncodeToString(entropy[:]), nil
 }
 
 func (b *Bridge) now() time.Time {
@@ -1215,6 +1255,22 @@ func authRequired(data any) *acp.RPCError {
 
 func (b *Bridge) authRequired(result adapterprocess.Result, err error) bool {
 	return b != nil && b.spec.AuthRequired != nil && b.spec.AuthRequired(result, err)
+}
+
+func (b *Bridge) classifyPromptFailure(session Session, command adapterprocess.Spec, result adapterprocess.Result, err error) string {
+	if b == nil || b.spec.ClassifyPromptFailure == nil {
+		return ""
+	}
+	var exitErr *adapterprocess.ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code == 0 {
+		return ""
+	}
+	switch b.spec.ClassifyPromptFailure(session, command, result, err) {
+	case PromptFailureNativeSessionMissing:
+		return "native_session_missing"
+	default:
+		return ""
+	}
 }
 
 func commandErrorData(result adapterprocess.Result, err error) map[string]any {
