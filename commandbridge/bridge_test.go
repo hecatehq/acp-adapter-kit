@@ -3,6 +3,7 @@ package commandbridge_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,109 @@ import (
 	adapterprocess "github.com/hecatehq/acp-adapter-kit/process"
 	"github.com/hecatehq/acp-adapter-kit/runtimeacp"
 )
+
+func TestBridgeDefaultSessionIDsDoNotCollideAcrossBridgeInstances(t *testing.T) {
+	assertDefaultID := func(t *testing.T, id string) {
+		t.Helper()
+		encoded := strings.TrimPrefix(id, "session-")
+		if encoded == id || len(encoded) != 32 {
+			t.Fatalf("session id = %q, want session- plus 128 bits", id)
+		}
+		if _, err := hex.DecodeString(encoded); err != nil {
+			t.Fatalf("session id = %q, want hexadecimal entropy: %v", id, err)
+		}
+	}
+	newSession := func(t *testing.T) string {
+		t.Helper()
+		bridge := commandbridge.New(commandbridge.Spec{})
+		client := acptest.NewClient(t, server(bridge))
+		created := client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+		var session struct {
+			SessionID string `json:"sessionId"`
+		}
+		created.ResultInto(t, &session)
+		return session.SessionID
+	}
+	type forkIDs struct {
+		source string
+		fork   string
+	}
+	newFork := func(t *testing.T) forkIDs {
+		t.Helper()
+		bridge := commandbridge.New(commandbridge.Spec{})
+		client := acptest.NewClient(t, server(bridge))
+		created := client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+		var source struct {
+			SessionID string `json:"sessionId"`
+		}
+		created.ResultInto(t, &source)
+		forked := client.Request("session/fork", map[string]any{"sessionId": source.SessionID})
+		var session struct {
+			SessionID string `json:"sessionId"`
+		}
+		forked.ResultInto(t, &session)
+		return forkIDs{source: source.SessionID, fork: session.SessionID}
+	}
+
+	t.Run("new", func(t *testing.T) {
+		first := newSession(t)
+		second := newSession(t)
+		if first == second {
+			t.Fatalf("independent bridges returned the same session id %q", first)
+		}
+		assertDefaultID(t, first)
+		assertDefaultID(t, second)
+	})
+	t.Run("fork", func(t *testing.T) {
+		first := newFork(t)
+		second := newFork(t)
+		for _, ids := range []forkIDs{first, second} {
+			if ids.fork == ids.source {
+				t.Fatalf("fork reused source session id %q", ids.source)
+			}
+			assertDefaultID(t, ids.source)
+			assertDefaultID(t, ids.fork)
+		}
+		if first.fork == second.fork {
+			t.Fatalf("independent bridges returned the same fork session id %q", first.fork)
+		}
+	})
+}
+
+func TestBridgeRejectsEmptyCustomSessionID(t *testing.T) {
+	t.Run("new", func(t *testing.T) {
+		bridge := commandbridge.New(commandbridge.Spec{NewID: func() string { return " " }})
+		client := acptest.NewClient(t, server(bridge))
+		response := client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+		if response.Error == nil || response.Error.Code != -32000 || response.Error.Message != "session id generation failed" {
+			t.Fatalf("session/new response = %#v, want session id generation error", response)
+		}
+	})
+	t.Run("fork", func(t *testing.T) {
+		ids := []string{"source", " "}
+		bridge := commandbridge.New(commandbridge.Spec{NewID: func() string {
+			id := ids[0]
+			ids = ids[1:]
+			return id
+		}})
+		client := acptest.NewClient(t, server(bridge))
+		client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+		response := client.Request("session/fork", map[string]any{"sessionId": "source"})
+		if response.Error == nil || response.Error.Code != -32000 || response.Error.Message != "session id generation failed" {
+			t.Fatalf("session/fork response = %#v, want session id generation error", response)
+		}
+		listed := client.Request("session/list", map[string]any{})
+		var list struct {
+			Sessions []struct {
+				SessionID string `json:"sessionId"`
+			} `json:"sessions"`
+		}
+		listed.ResultInto(t, &list)
+		if len(list.Sessions) != 1 || list.Sessions[0].SessionID != "source" {
+			t.Fatalf("sessions after failed fork = %#v, want only source", list.Sessions)
+		}
+	})
+}
 
 func TestBridgeRunsPromptCommandAndStreamsOutput(t *testing.T) {
 	var saw commandbridge.Session
@@ -1599,8 +1703,11 @@ func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
 			return adapterprocess.Spec{Command: "agent"}, nil
 		},
+		ClassifyPromptFailure: func(commandbridge.Session, adapterprocess.Spec, adapterprocess.Result, error) commandbridge.PromptFailureKind {
+			return commandbridge.PromptFailureUnknown
+		},
 		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
-			return adapterprocess.Result{Stderr: []byte("boom")}, errors.New("exit 2")
+			return adapterprocess.Result{Stderr: []byte("boom")}, &adapterprocess.ExitError{Command: "agent", Code: 2}
 		}),
 	})
 	client := acptest.NewClient(t, server(bridge))
@@ -1634,6 +1741,9 @@ func TestBridgePromptCommandErrorMapsToRPCError(t *testing.T) {
 	if !bytes.Contains(raw, []byte("boom")) {
 		t.Fatalf("error data = %s, want stderr", raw)
 	}
+	if bytes.Contains(raw, []byte("errorKind")) {
+		t.Fatalf("error data = %s, did not expect a discriminator for unknown failure", raw)
+	}
 }
 
 func TestBridgePromptCommandAuthFailureMapsToAuthRequired(t *testing.T) {
@@ -1645,8 +1755,12 @@ func TestBridgePromptCommandAuthFailureMapsToAuthRequired(t *testing.T) {
 		AuthRequired: func(result adapterprocess.Result, err error) bool {
 			return err != nil && strings.Contains(string(result.Stderr), "not signed in")
 		},
+		ClassifyPromptFailure: func(commandbridge.Session, adapterprocess.Spec, adapterprocess.Result, error) commandbridge.PromptFailureKind {
+			t.Fatal("ClassifyPromptFailure called after AuthRequired matched")
+			return commandbridge.PromptFailureNativeSessionMissing
+		},
 		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
-			return adapterprocess.Result{Stderr: []byte("agent is not signed in")}, errors.New("exit 1")
+			return adapterprocess.Result{Stderr: []byte("agent is not signed in")}, &adapterprocess.ExitError{Command: "agent", Code: 1}
 		}),
 	})
 	client := acptest.NewClient(t, server(bridge))
@@ -1663,6 +1777,132 @@ func TestBridgePromptCommandAuthFailureMapsToAuthRequired(t *testing.T) {
 	raw, _ := json.Marshal(resp.Error.Data)
 	if !bytes.Contains(raw, []byte("agent is not signed in")) {
 		t.Fatalf("error data = %s, want stderr", raw)
+	}
+	if bytes.Contains(raw, []byte("errorKind")) {
+		t.Fatalf("error data = %s, auth failure must not be classified as recoverable", raw)
+	}
+}
+
+func TestBridgePromptFailureClassificationAddsWireDiscriminator(t *testing.T) {
+	runs := 0
+	var built []commandbridge.Session
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(session commandbridge.Session, _ runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			built = append(built, session)
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		ClassifyPromptFailure: func(session commandbridge.Session, command adapterprocess.Spec, result adapterprocess.Result, err error) commandbridge.PromptFailureKind {
+			if session.ID == "session-1" && command.Command == "agent" && err != nil && strings.Contains(string(result.Stderr), "native history missing") {
+				return commandbridge.PromptFailureNativeSessionMissing
+			}
+			return commandbridge.PromptFailureUnknown
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			runs++
+			if runs > 1 {
+				return adapterprocess.Result{Stdout: []byte("recovered")}, nil
+			}
+			return adapterprocess.Result{Stderr: []byte("native history missing")}, &adapterprocess.ExitError{Command: "agent", Code: 1}
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "hello"))
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want tool start + tool finish + prompt error", len(responses))
+	}
+	resp := responses[2]
+	if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != "prompt command failed" {
+		t.Fatalf("response error = %#v, want classified prompt command failure", resp.Error)
+	}
+	raw, _ := json.Marshal(resp.Error.Data)
+	if !bytes.Contains(raw, []byte(`"errorKind":"native_session_missing"`)) || !bytes.Contains(raw, []byte("native history missing")) {
+		t.Fatalf("error data = %s, want error kind and provider stderr", raw)
+	}
+	if runs != 1 {
+		t.Fatalf("runner calls after classified failure = %d, want exactly one", runs)
+	}
+	listed := client.Request("session/list", map[string]any{})
+	var list struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+		} `json:"sessions"`
+	}
+	listed.ResultInto(t, &list)
+	if len(list.Sessions) != 1 || list.Sessions[0].SessionID != "session-1" {
+		t.Fatalf("sessions after classified failure = %#v, want original session", list.Sessions)
+	}
+	second := client.Send(promptRequest(3, "session-1", "retry under host control"))
+	if len(second) != 4 || second[len(second)-1].Error != nil {
+		t.Fatalf("second prompt responses = %#v, want original session to remain usable", second)
+	}
+	if len(built) != 2 || built[1].PromptCount != 0 {
+		t.Fatalf("prompt build state = %#v, want failed prompt not counted", built)
+	}
+}
+
+func TestBridgePromptFailureClassificationRequiresCommandExit(t *testing.T) {
+	classifierCalled := false
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		ClassifyPromptFailure: func(commandbridge.Session, adapterprocess.Spec, adapterprocess.Result, error) commandbridge.PromptFailureKind {
+			classifierCalled = true
+			return commandbridge.PromptFailureNativeSessionMissing
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stderr: []byte("native history missing")}, errors.New("stream parser failed")
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "hello"))
+	if len(responses) != 3 || responses[len(responses)-1].Error == nil {
+		t.Fatalf("responses = %#v, want tool start + tool finish + prompt error", responses)
+	}
+	if classifierCalled {
+		t.Fatal("ClassifyPromptFailure called for a non-exit failure")
+	}
+	resp := responses[len(responses)-1]
+	raw, _ := json.Marshal(resp.Error.Data)
+	if bytes.Contains(raw, []byte("errorKind")) {
+		t.Fatalf("error data = %s, non-exit failure must not be classified", raw)
+	}
+}
+
+func TestBridgePromptFailureClassificationRequiresNonzeroCommandExit(t *testing.T) {
+	classifierCalled := false
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent"}, nil
+		},
+		ClassifyPromptFailure: func(commandbridge.Session, adapterprocess.Spec, adapterprocess.Result, error) commandbridge.PromptFailureKind {
+			classifierCalled = true
+			return commandbridge.PromptFailureNativeSessionMissing
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stderr: []byte("native history missing")}, &adapterprocess.ExitError{Command: "agent", Code: 0}
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp/work"})
+
+	responses := client.Send(promptRequest(2, "session-1", "hello"))
+	if len(responses) != 3 || responses[len(responses)-1].Error == nil {
+		t.Fatalf("responses = %#v, want tool start + tool finish + prompt error", responses)
+	}
+	if classifierCalled {
+		t.Fatal("ClassifyPromptFailure called for a zero exit code")
+	}
+	raw, _ := json.Marshal(responses[len(responses)-1].Error.Data)
+	if bytes.Contains(raw, []byte("errorKind")) {
+		t.Fatalf("error data = %s, zero exit code must not be classified", raw)
 	}
 }
 

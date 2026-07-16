@@ -44,11 +44,17 @@ Adapters have two runtime integration paths:
   publishing `session_info_update` notifications when transcript metadata
   changes, translating structured command streams into ACP updates when a
   parser is configured, requesting ACP tool permissions from parsed stream
-  events before continuing, and optionally prepending a bounded transcript
-  prelude to later prompt commands. Adapters for CLIs with native session ids
-  may opt into adopting unknown `session/load` or `session/resume` ids so the
-  provider command can continue a session known to the host after an adapter
-  process restart. Command-backed adapters can also advertise ACP
+  events before continuing, optionally mapping provider-specific missing native
+  conversation failures to a typed `native_session_missing` prompt-error
+  discriminator, and optionally prepending a bounded transcript prelude to
+  later prompt commands.
+  The host decides whether replacing that missing native conversation is safe;
+  the kit never retries a prompt. The classifier runs only for a non-zero
+  process exit; adapters must also reject partial or truncated output and bind
+  provider-specific failures to the exact native session. Adapters for CLIs
+  with native session ids may opt into adopting unknown `session/load` or
+  `session/resume` ids so the provider command can continue a session known to
+  the host after an adapter process restart. Command-backed adapters can also advertise ACP
   `session/delete` as destructive in-memory session cleanup, advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
