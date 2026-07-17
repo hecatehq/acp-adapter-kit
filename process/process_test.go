@@ -439,6 +439,28 @@ func TestMissingBinaryReturnsTypedError(t *testing.T) {
 	}
 }
 
+func TestRunStreamMissingBinaryReturnsTypedError(t *testing.T) {
+	_, err := adapterprocess.RunStream(context.Background(), adapterprocess.Spec{
+		Command: filepath.Join(t.TempDir(), "missing-binary"),
+		Dir:     t.TempDir(),
+	}, nil)
+	var missing *adapterprocess.CommandNotFoundError
+	if !errors.As(err, &missing) {
+		t.Fatalf("error = %T %[1]v, want CommandNotFoundError", err)
+	}
+}
+
+func TestStartMissingBinaryReturnsTypedError(t *testing.T) {
+	child, err := adapterprocess.Start(context.Background(), adapterprocess.StartSpec{
+		Command: filepath.Join(t.TempDir(), "missing-binary"),
+		Dir:     t.TempDir(),
+	})
+	var missing *adapterprocess.CommandNotFoundError
+	if child != nil || !errors.As(err, &missing) {
+		t.Fatalf("Start = (%v, %T %[2]v), want nil child and CommandNotFoundError", child, err)
+	}
+}
+
 func helperCommand(mode string, args ...string) (string, []string) {
 	command := os.Args[0]
 	helperArgs := []string{"-test.run=TestProcessHelper", "--", mode}
