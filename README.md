@@ -64,8 +64,9 @@ Adapters have two runtime integration paths:
   `session/delete` as destructive in-memory session cleanup, advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
-  Command subprocesses run in an owned Unix process group so cancellation also
-  terminates descendants; inherited pipe drain is bounded on every platform.
+  Command subprocesses run in an owned Unix process group or Windows
+  kill-on-close Job Object, so cancellation terminates descendants before the
+  runtime returns; inherited pipe drain is bounded on every platform.
   Resource-link prompt blocks are rendered as explicit attachment name, MIME
   type, and URI text so command-backed CLIs can consume host-staged file and
   image paths without claiming unsupported inline ACP content. Bounded

@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/coder/acp-go-sdk v0.13.5
 	github.com/spf13/cobra v1.10.1
+	golang.org/x/sys v0.41.0
 )
 
 require (
