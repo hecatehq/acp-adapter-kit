@@ -284,6 +284,11 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 	cmd.Stderr = stderr
 
+	if err := ctx.Err(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, fmt.Errorf("start process %q: process cancelled: %w", resolved, err)
+	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
@@ -325,6 +330,9 @@ func (c *Child) Kill() error {
 }
 
 func runProcessContext(ctx context.Context, cmd *exec.Cmd) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}

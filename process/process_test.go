@@ -262,6 +262,42 @@ func TestContextCancellationKillsProcess(t *testing.T) {
 	}
 }
 
+func TestPreCancelledRunDoesNotStartProcess(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "run-started")
+	command, args := helperCommand("write-marker", marker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := adapterprocess.Run(ctx, adapterprocess.Spec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env:     adapterprocess.EnvPolicy{Set: map[string]string{"GO_WANT_PROCESS_HELPER": "1"}},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context cancellation", err)
+	}
+	assertProcessHelperDidNotStart(t, marker)
+}
+
+func TestPreCancelledRunStreamDoesNotStartProcess(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "stream-started")
+	command, args := helperCommand("write-marker", marker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := adapterprocess.RunStream(ctx, adapterprocess.Spec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env:     adapterprocess.EnvPolicy{Set: map[string]string{"GO_WANT_PROCESS_HELPER": "1"}},
+	}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunStream error = %v, want context cancellation", err)
+	}
+	assertProcessHelperDidNotStart(t, marker)
+}
+
 func TestStartUsesFixedArgvEnvAndPipes(t *testing.T) {
 	command, args := helperCommand("stream", "literal;echo", "$HOME")
 	child, err := adapterprocess.Start(context.Background(), adapterprocess.StartSpec{
@@ -366,6 +402,32 @@ func TestStartContextCancellationKillsProcess(t *testing.T) {
 	}
 }
 
+func TestPreCancelledStartDoesNotStartProcess(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "start-called")
+	command, args := helperCommand("write-marker", marker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	child, err := adapterprocess.Start(ctx, adapterprocess.StartSpec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env:     adapterprocess.EnvPolicy{Set: map[string]string{"GO_WANT_PROCESS_HELPER": "1"}},
+	})
+	if child != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = (%v, %v), want nil child and context cancellation", child, err)
+	}
+	assertProcessHelperDidNotStart(t, marker)
+}
+
+func assertProcessHelperDidNotStart(t *testing.T, marker string) {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-cancelled process created marker: %v", err)
+	}
+}
+
 func TestMissingBinaryReturnsTypedError(t *testing.T) {
 	_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
 		Command: filepath.Join(t.TempDir(), "missing-binary"),
@@ -420,6 +482,14 @@ func TestProcessHelper(t *testing.T) {
 		os.Exit(7)
 	case "sleep":
 		time.Sleep(5 * time.Second)
+	case "write-marker":
+		if len(rest) != 1 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(rest[0], []byte("started"), 0o600); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(3)
+		}
 	case "spawn-descendant":
 		if len(rest) != 2 {
 			os.Exit(2)
