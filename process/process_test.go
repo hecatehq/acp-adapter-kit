@@ -101,6 +101,57 @@ func TestRunUsesFixedArgvAndAllowlistedEnv(t *testing.T) {
 	}
 }
 
+func TestRunWithBaseEnvDoesNotConsultHostEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "host-secret")
+	command, args := helperCommand("argv-env", "base-env")
+	result, err := adapterprocess.RunWithBaseEnv(context.Background(), adapterprocess.Spec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env: adapterprocess.EnvPolicy{
+			Inherit: []string{"VISIBLE", "OPENAI_API_KEY"},
+			Set:     map[string]string{"GO_WANT_PROCESS_HELPER": "1"},
+		},
+		StdoutLimit: 1024,
+		StderrLimit: 1024,
+	}, []string{"VISIBLE=from-host-boundary"})
+	if err != nil {
+		t.Fatalf("RunWithBaseEnv returned error: %v; stderr=%s", err, result.Stderr)
+	}
+	out := string(result.Stdout)
+	if !strings.Contains(out, "VISIBLE=from-host-boundary") {
+		t.Fatalf("stdout = %q, want supplied base environment", out)
+	}
+	if strings.Contains(out, "OPENAI_API_KEY=") {
+		t.Fatalf("stdout = %q, leaked process environment outside supplied base", out)
+	}
+}
+
+func TestRunStreamWithBaseEnvUsesSuppliedEnvironment(t *testing.T) {
+	command, args := helperCommand("argv-env", "stream-base-env")
+	var streamed strings.Builder
+	result, err := adapterprocess.RunStreamWithBaseEnv(context.Background(), adapterprocess.Spec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env: adapterprocess.EnvPolicy{
+			Inherit: []string{"VISIBLE"},
+			Set:     map[string]string{"GO_WANT_PROCESS_HELPER": "1"},
+		},
+		StdoutLimit: 1024,
+		StderrLimit: 1024,
+	}, []string{"VISIBLE=stream-boundary"}, func(chunk []byte) error {
+		streamed.Write(chunk)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunStreamWithBaseEnv returned error: %v; stderr=%s", err, result.Stderr)
+	}
+	if !strings.Contains(streamed.String(), "VISIBLE=stream-boundary") {
+		t.Fatalf("streamed = %q, want supplied base environment", streamed.String())
+	}
+}
+
 func TestOutputLimits(t *testing.T) {
 	command, args := helperCommand("output")
 	result, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{

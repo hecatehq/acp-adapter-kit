@@ -33,14 +33,36 @@ func (f RunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterp
 	return f(ctx, spec)
 }
 
-type ProcessRunner struct{}
-
-func (ProcessRunner) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
-	return adapterprocess.Run(ctx, spec)
+type ProcessRunner struct {
+	baseEnv    []string
+	baseEnvSet bool
 }
 
-func (ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
-	return adapterprocess.RunStream(ctx, spec, onStdout)
+// NewProcessRunner binds provider subprocesses to a host-supplied environment.
+// The slice is copied so later caller mutation cannot widen the runtime
+// boundary. Passing an empty slice intentionally inherits nothing.
+func NewProcessRunner(baseEnv []string) ProcessRunner {
+	if baseEnv == nil {
+		baseEnv = []string{}
+	}
+	return ProcessRunner{
+		baseEnv:    append([]string(nil), baseEnv...),
+		baseEnvSet: true,
+	}
+}
+
+func (r ProcessRunner) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
+	if !r.baseEnvSet {
+		return adapterprocess.Run(ctx, spec)
+	}
+	return adapterprocess.RunWithBaseEnv(ctx, spec, r.baseEnv)
+}
+
+func (r ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, onStdout func([]byte) error) (adapterprocess.Result, error) {
+	if !r.baseEnvSet {
+		return adapterprocess.RunStream(ctx, spec, onStdout)
+	}
+	return adapterprocess.RunStreamWithBaseEnv(ctx, spec, r.baseEnv, onStdout)
 }
 
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
@@ -1301,9 +1323,32 @@ func PromptText(params runtimeacp.PromptParams) string {
 					parts = append(parts, text)
 				}
 			}
+		case "resource_link":
+			if attachment := resourceLinkPromptText(block); attachment != "" {
+				parts = append(parts, attachment)
+			}
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func resourceLinkPromptText(block runtimeacp.ContentBlock) string {
+	uri := strings.TrimSpace(block.URI)
+	if uri == "" {
+		return ""
+	}
+	name := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(block.Name))
+	mediaType := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(block.MimeType))
+	switch {
+	case name != "" && mediaType != "":
+		return fmt.Sprintf("Attached file %q (%s) is available at:\n%s", name, mediaType, uri)
+	case name != "":
+		return fmt.Sprintf("Attached file %q is available at:\n%s", name, uri)
+	case mediaType != "":
+		return fmt.Sprintf("An attached file (%s) is available at:\n%s", mediaType, uri)
+	default:
+		return "An attached file is available at:\n" + uri
+	}
 }
 
 func RequirePromptText(params runtimeacp.PromptParams) (string, error) {

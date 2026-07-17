@@ -1562,6 +1562,25 @@ func TestBridgePassesAdoptedStateForLoadedUnknownSession(t *testing.T) {
 	}
 }
 
+func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
+	t.Parallel()
+
+	got := commandbridge.PromptText(runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{
+		{Type: "text", Text: "Inspect the input."},
+		{
+			Type:     "resource_link",
+			Name:     "screen.png",
+			MimeType: "image/png",
+			URI:      "file:///tmp/private/screen.png",
+		},
+	}})
+	for _, want := range []string{"Inspect the input.", `Attached file "screen.png" (image/png)`, "file:///tmp/private/screen.png"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("PromptText() = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestBridgeCancelStopsStreamingPromptWithoutRecordingTranscript(t *testing.T) {
 	started := make(chan struct{})
 	var prompts []string

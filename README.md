@@ -30,6 +30,12 @@ repos should pass only the provider-specific runtime variables they intend the
 child runtime to see; the kit does not inherit the parent environment by
 default.
 
+Embedded hosts can construct `commandbridge.ProcessRunner` with a host-owned
+base environment. That constructor always treats its input as authoritative;
+nil or empty means inherit nothing, so provider subprocesses cannot recover
+secrets from the host process. At the lower-level process API, a nil base keeps
+the standalone adapter's normal system-environment behavior.
+
 Adapters have two runtime integration paths:
 
 - `runtimehost` / `runtimebridge` proxy an explicit child ACP runtime process.
@@ -58,6 +64,9 @@ Adapters have two runtime integration paths:
   `session/delete` as destructive in-memory session cleanup, advertise ACP
   `authMethods`, run a fixed-argv native login command for `authenticate`, and
   advertise/run ACP `logout` when the provider CLI supports ending local auth.
+  Resource-link prompt blocks are rendered as explicit attachment name, MIME
+  type, and URI text so command-backed CLIs can consume host-staged file and
+  image paths without claiming unsupported inline ACP content.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

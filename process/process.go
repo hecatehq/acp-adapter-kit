@@ -89,6 +89,14 @@ type Child struct {
 }
 
 func Run(ctx context.Context, spec Spec) (Result, error) {
+	return RunWithBaseEnv(ctx, spec, nil)
+}
+
+// RunWithBaseEnv executes a fixed-argv process after applying spec.Env to the
+// supplied host environment. A nil base preserves Run's process-environment
+// behavior; a non-nil empty slice starts from no inherited values. Embedding
+// hosts use this seam to keep their own credential and HOME boundary intact.
+func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -104,7 +112,7 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	env, err := BuildEnv(os.Environ(), spec.Env)
+	env, err := BuildEnv(resolveBaseEnv(baseEnv), spec.Env)
 	if err != nil {
 		return Result{}, err
 	}
@@ -145,6 +153,11 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 }
 
 func RunStream(ctx context.Context, spec Spec, onStdout func([]byte) error) (Result, error) {
+	return RunStreamWithBaseEnv(ctx, spec, nil, onStdout)
+}
+
+// RunStreamWithBaseEnv is RunWithBaseEnv's streaming counterpart.
+func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onStdout func([]byte) error) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -160,7 +173,7 @@ func RunStream(ctx context.Context, spec Spec, onStdout func([]byte) error) (Res
 	if err != nil {
 		return Result{}, err
 	}
-	env, err := BuildEnv(os.Environ(), spec.Env)
+	env, err := BuildEnv(resolveBaseEnv(baseEnv), spec.Env)
 	if err != nil {
 		return Result{}, err
 	}
@@ -204,6 +217,13 @@ func RunStream(ctx context.Context, spec Spec, onStdout func([]byte) error) (Res
 		return result, &CommandNotFoundError{Command: spec.Command, Err: runErr}
 	}
 	return result, fmt.Errorf("run process %q: %w", resolved, runErr)
+}
+
+func resolveBaseEnv(baseEnv []string) []string {
+	if baseEnv == nil {
+		return os.Environ()
+	}
+	return append([]string(nil), baseEnv...)
 }
 
 func Start(ctx context.Context, spec StartSpec) (*Child, error) {
