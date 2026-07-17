@@ -3,6 +3,7 @@
 package process
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +12,10 @@ import (
 
 func configureProcessUnit(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func startProcessUnit(_ context.Context, cmd *exec.Cmd) error {
+	return cmd.Start()
 }
 
 func cancelProcessUnit(cmd *exec.Cmd) error {

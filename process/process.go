@@ -265,6 +265,11 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse an already-cancelled launch before StdinPipe and StdoutPipe
+	// allocate child-side descriptors that only Cmd.Start can close.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("start process %q: process cancelled: %w", resolved, err)
+	}
 
 	cmd := exec.Command(resolved, spec.Args...)
 	configureProcessUnit(cmd)
@@ -284,12 +289,10 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 	cmd.Stderr = stderr
 
-	if err := ctx.Err(); err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		return nil, fmt.Errorf("start process %q: process cancelled: %w", resolved, err)
-	}
-	if err := cmd.Start(); err != nil {
+	// Cancellation racing after the pre-allocation check proceeds through the
+	// platform start boundary so os/exec closes every pipe and the process unit
+	// watcher can terminate the just-started child without leaking descriptors.
+	if err := startProcessUnit(ctx, cmd); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		if os.IsNotExist(err) {
@@ -333,7 +336,7 @@ func runProcessContext(ctx context.Context, cmd *exec.Cmd) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startProcessUnit(ctx, cmd); err != nil {
 		return err
 	}
 	waitDone := make(chan error, 1)
