@@ -1584,8 +1584,10 @@ func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
 func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 	t.Parallel()
 
-	const attachmentURI = "file:///tmp/private-turn/screen.png"
+	const attachmentURI = "file:///tmp/private-turn/screen%20shot.png"
+	const attachmentPath = "/tmp/private-turn/screen shot.png"
 	var prompts []string
+	var runCount int
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID:             func() string { return "session-1" },
 		IncludeTranscript: true,
@@ -1598,6 +1600,10 @@ func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 			return adapterprocess.Spec{Command: "agent", Dir: "/tmp"}, nil
 		},
 		Runner: commandbridge.RunnerFunc(func(_ context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
+			runCount++
+			if runCount == 1 {
+				return adapterprocess.Result{Stdout: []byte("Inspected " + attachmentURI + " at " + attachmentPath)}, nil
+			}
 			return adapterprocess.Result{Stdout: []byte("ok")}, nil
 		}),
 	})
@@ -1631,6 +1637,12 @@ func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 	}
 	if strings.Contains(prompts[1], attachmentURI) {
 		t.Fatalf("second prompt = %q, must not replay ephemeral attachment URI", prompts[1])
+	}
+	if strings.Contains(prompts[1], attachmentPath) {
+		t.Fatalf("second prompt = %q, must not replay decoded attachment path", prompts[1])
+	}
+	if !strings.Contains(prompts[1], "Inspected [attachment path omitted] at [attachment path omitted]") {
+		t.Fatalf("second prompt = %q, want non-sensitive assistant transcript with path aliases removed", prompts[1])
 	}
 	if !strings.Contains(prompts[1], `Attached file "screen.png" (image/png) was provided for this turn.`) {
 		t.Fatalf("second prompt = %q, want retained attachment metadata", prompts[1])

@@ -69,8 +69,9 @@ Adapters have two runtime integration paths:
   Resource-link prompt blocks are rendered as explicit attachment name, MIME
   type, and URI text so command-backed CLIs can consume host-staged file and
   image paths without claiming unsupported inline ACP content. Bounded
-  transcripts retain only attachment metadata; ephemeral paths are never
-  replayed after the originating command.
+  transcripts retain only attachment metadata; ephemeral paths are removed
+  from both user and assistant history and never replayed after the originating
+  command.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

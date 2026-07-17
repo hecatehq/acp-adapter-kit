@@ -82,11 +82,12 @@ type Child struct {
 	Stdin   io.WriteCloser
 	Stdout  io.ReadCloser
 
-	ctx      context.Context
-	cmd      *exec.Cmd
-	stderr   *limitedBuffer
-	waitOnce sync.Once
-	waitErr  error
+	ctx             context.Context
+	cmd             *exec.Cmd
+	stderr          *limitedBuffer
+	stopCancelWatch func()
+	waitOnce        sync.Once
+	waitErr         error
 }
 
 func Run(ctx context.Context, spec Spec) (Result, error) {
@@ -121,7 +122,7 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 	stdout := newLimitedBuffer(limitOrDefault(spec.StdoutLimit))
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
-	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	cmd := exec.Command(resolved, spec.Args...)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -129,7 +130,7 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	err = cmd.Run()
+	err = runProcessContext(ctx, cmd)
 	result := Result{
 		Command:         resolved,
 		Args:            append([]string(nil), spec.Args...),
@@ -183,6 +184,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var cmd *exec.Cmd
 	stdout := &streamingBuffer{
 		buffer: newLimitedBuffer(limitOrDefault(spec.StdoutLimit)),
 		stream: func(chunk []byte) error {
@@ -191,6 +193,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 			}
 			if err := onStdout(chunk); err != nil {
 				cancel()
+				_ = cancelProcessUnit(cmd)
 				return err
 			}
 			return nil
@@ -198,7 +201,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 	}
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
-	cmd := exec.CommandContext(runCtx, resolved, spec.Args...)
+	cmd = exec.Command(resolved, spec.Args...)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -206,7 +209,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	runErr := cmd.Run()
+	runErr := runProcessContext(runCtx, cmd)
 	result := Result{
 		Command:         resolved,
 		Args:            append([]string(nil), spec.Args...),
@@ -263,7 +266,7 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	cmd := exec.Command(resolved, spec.Args...)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -289,16 +292,18 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 		}
 		return nil, fmt.Errorf("start process %q: %w", resolved, err)
 	}
+	stopCancelWatch := watchProcessContext(ctx, cmd)
 
 	return &Child{
-		Command: resolved,
-		Args:    append([]string(nil), spec.Args...),
-		Dir:     dir,
-		Stdin:   stdin,
-		Stdout:  stdout,
-		ctx:     ctx,
-		cmd:     cmd,
-		stderr:  stderr,
+		Command:         resolved,
+		Args:            append([]string(nil), spec.Args...),
+		Dir:             dir,
+		Stdin:           stdin,
+		Stdout:          stdout,
+		ctx:             ctx,
+		cmd:             cmd,
+		stderr:          stderr,
+		stopCancelWatch: stopCancelWatch,
 	}, nil
 }
 
@@ -319,14 +324,44 @@ func (c *Child) Kill() error {
 	return nil
 }
 
-func cancelProcessUnit(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
+func runProcessContext(ctx context.Context, cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	if cmd.Cancel != nil {
-		return cmd.Cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+	select {
+	case err := <-waitDone:
+		// A command may exit after spawning a helper. End the owned unit before
+		// returning even when the caller did not cancel.
+		_ = cancelProcessUnit(cmd)
+		return err
+	case <-ctx.Done():
+		// Do not rely on os/exec's internal context-vs-Wait race. Explicitly
+		// terminate the complete unit, then acknowledge its output drain.
+		_ = cancelProcessUnit(cmd)
+		err := <-waitDone
+		_ = cancelProcessUnit(cmd)
+		return err
 	}
-	return cmd.Process.Kill()
+}
+
+func watchProcessContext(ctx context.Context, cmd *exec.Cmd) func() {
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	stop := func() {
+		doneOnce.Do(func() { close(done) })
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = cancelProcessUnit(cmd)
+		case <-done:
+		}
+	}()
+	return stop
 }
 
 func (c *Child) Wait() error {
@@ -335,6 +370,10 @@ func (c *Child) Wait() error {
 	}
 	c.waitOnce.Do(func() {
 		err := c.cmd.Wait()
+		_ = cancelProcessUnit(c.cmd)
+		if c.stopCancelWatch != nil {
+			c.stopCancelWatch()
+		}
 		if c.ctx.Err() != nil {
 			c.waitErr = fmt.Errorf("process cancelled: %w", c.ctx.Err())
 			return

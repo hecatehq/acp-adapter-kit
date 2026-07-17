@@ -421,7 +421,7 @@ func TestProcessHelper(t *testing.T) {
 	case "sleep":
 		time.Sleep(5 * time.Second)
 	case "spawn-descendant":
-		if len(rest) != 1 {
+		if len(rest) != 2 {
 			os.Exit(2)
 		}
 		child := exec.Command(os.Args[0], "-test.run=TestProcessHelper", "--", "delayed-write", rest[0])
@@ -432,8 +432,37 @@ func TestProcessHelper(t *testing.T) {
 			fmt.Fprint(os.Stderr, err)
 			os.Exit(3)
 		}
+		if err := os.WriteFile(rest[1], []byte("ready"), 0o600); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(4)
+		}
 		fmt.Printf("DESCENDANT_PID=%d\n", child.Process.Pid)
 		time.Sleep(5 * time.Second)
+	case "spawn-descendant-racy-exit":
+		if len(rest) != 3 {
+			os.Exit(2)
+		}
+		child := exec.Command(os.Args[0], "-test.run=TestProcessHelper", "--", "delayed-write", rest[0])
+		child.Env = os.Environ()
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(3)
+		}
+		if err := os.WriteFile(rest[1], []byte("ready"), 0o600); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(4)
+		}
+		for {
+			if _, err := os.Stat(rest[2]); err == nil {
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprint(os.Stderr, err)
+				os.Exit(5)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	case "delayed-write":
 		if len(rest) != 1 {
 			os.Exit(2)
