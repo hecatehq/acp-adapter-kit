@@ -497,7 +497,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
 	b.recordPromptSuccess(req.SessionID)
-	if info, ok := b.recordTranscriptExchange(req.SessionID, PromptText(req), assistantText); ok {
+	if info, ok := b.recordTranscriptExchange(req.SessionID, transcriptPromptText(req), assistantText); ok {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
@@ -1310,6 +1310,14 @@ func commandErrorData(result adapterprocess.Result, err error) map[string]any {
 }
 
 func PromptText(params runtimeacp.PromptParams) string {
+	return renderPromptText(params, true)
+}
+
+func transcriptPromptText(params runtimeacp.PromptParams) string {
+	return renderPromptText(params, false)
+}
+
+func renderPromptText(params runtimeacp.PromptParams, includeResourceLinkURI bool) string {
 	var parts []string
 	for _, block := range params.Prompt {
 		switch block.Type {
@@ -1324,7 +1332,7 @@ func PromptText(params runtimeacp.PromptParams) string {
 				}
 			}
 		case "resource_link":
-			if attachment := resourceLinkPromptText(block); attachment != "" {
+			if attachment := resourceLinkPromptText(block, includeResourceLinkURI); attachment != "" {
 				parts = append(parts, attachment)
 			}
 		}
@@ -1332,13 +1340,25 @@ func PromptText(params runtimeacp.PromptParams) string {
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
-func resourceLinkPromptText(block runtimeacp.ContentBlock) string {
+func resourceLinkPromptText(block runtimeacp.ContentBlock, includeURI bool) string {
 	uri := strings.TrimSpace(block.URI)
-	if uri == "" {
+	if includeURI && uri == "" {
 		return ""
 	}
 	name := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(block.Name))
 	mediaType := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(block.MimeType))
+	if !includeURI {
+		switch {
+		case name != "" && mediaType != "":
+			return fmt.Sprintf("Attached file %q (%s) was provided for this turn.", name, mediaType)
+		case name != "":
+			return fmt.Sprintf("Attached file %q was provided for this turn.", name)
+		case mediaType != "":
+			return fmt.Sprintf("An attached file (%s) was provided for this turn.", mediaType)
+		default:
+			return "An attached file was provided for this turn."
+		}
+	}
 	switch {
 	case name != "" && mediaType != "":
 		return fmt.Sprintf("Attached file %q (%s) is available at:\n%s", name, mediaType, uri)

@@ -1581,6 +1581,62 @@ func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
 	}
 }
 
+func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
+	t.Parallel()
+
+	const attachmentURI = "file:///tmp/private-turn/screen.png"
+	var prompts []string
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:             func() string { return "session-1" },
+		IncludeTranscript: true,
+		BuildPrompt: func(_ commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			prompts = append(prompts, text)
+			return adapterprocess.Spec{Command: "agent", Dir: "/tmp"}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp"})
+
+	client.Send(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt": []map[string]any{
+				{"type": "text", "text": "Inspect the input."},
+				{
+					"type":     "resource_link",
+					"name":     "screen.png",
+					"mimeType": "image/png",
+					"uri":      attachmentURI,
+				},
+			},
+		},
+	})
+	client.Send(promptRequest(3, "session-1", "What did you find?"))
+
+	if len(prompts) != 2 {
+		t.Fatalf("prompt count = %d, want 2", len(prompts))
+	}
+	if !strings.Contains(prompts[0], attachmentURI) {
+		t.Fatalf("first prompt = %q, want current-turn attachment URI", prompts[0])
+	}
+	if strings.Contains(prompts[1], attachmentURI) {
+		t.Fatalf("second prompt = %q, must not replay ephemeral attachment URI", prompts[1])
+	}
+	if !strings.Contains(prompts[1], `Attached file "screen.png" (image/png) was provided for this turn.`) {
+		t.Fatalf("second prompt = %q, want retained attachment metadata", prompts[1])
+	}
+}
+
 func TestBridgeCancelStopsStreamingPromptWithoutRecordingTranscript(t *testing.T) {
 	started := make(chan struct{})
 	var prompts []string

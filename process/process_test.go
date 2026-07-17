@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -419,6 +420,29 @@ func TestProcessHelper(t *testing.T) {
 		os.Exit(7)
 	case "sleep":
 		time.Sleep(5 * time.Second)
+	case "spawn-descendant":
+		if len(rest) != 1 {
+			os.Exit(2)
+		}
+		child := exec.Command(os.Args[0], "-test.run=TestProcessHelper", "--", "delayed-write", rest[0])
+		child.Env = os.Environ()
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(3)
+		}
+		fmt.Printf("DESCENDANT_PID=%d\n", child.Process.Pid)
+		time.Sleep(5 * time.Second)
+	case "delayed-write":
+		if len(rest) != 1 {
+			os.Exit(2)
+		}
+		time.Sleep(500 * time.Millisecond)
+		if err := os.WriteFile(rest[0], []byte("late mutation"), 0o600); err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(4)
+		}
 	case "stream":
 		stdin, _ := io.ReadAll(os.Stdin)
 		fmt.Printf("ARGS=%s\n", strings.Join(rest, ","))
