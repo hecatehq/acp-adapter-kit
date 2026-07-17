@@ -313,10 +313,6 @@ func promptTranscriptText(params runtimeacp.PromptParams) string {
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
-func scrubPromptResourcePaths(text string, params runtimeacp.PromptParams, stageDir string) string {
-	return newPromptResourceRedactor(params, stageDir).Redact(text)
-}
-
 type promptResourceRedactor struct {
 	aliases         []string
 	caseInsensitive bool

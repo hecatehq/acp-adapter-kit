@@ -315,10 +315,6 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	}, nil
 }
 
-func isCommandNotFound(err error) bool {
-	return os.IsNotExist(err) || errors.Is(err, exec.ErrNotFound)
-}
-
 func (c *Child) PID() int {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
 		return 0

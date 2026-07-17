@@ -1633,7 +1633,7 @@ func TestBridgePassesAdoptedStateForLoadedUnknownSession(t *testing.T) {
 	}
 }
 
-func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
+func TestPromptTextRejectsUnpreparedResourceLinkAttachments(t *testing.T) {
 	t.Parallel()
 
 	got := commandbridge.PromptText(runtimeacp.PromptParams{Prompt: []runtimeacp.ContentBlock{
@@ -1645,14 +1645,12 @@ func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
 			URI:      "file:///tmp/private/screen.png",
 		},
 	}})
-	for _, want := range []string{"Inspect the input.", `Attached file "screen.png" (image/png)`, "file:///tmp/private/screen.png"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("PromptText() = %q, want %q", got, want)
-		}
+	if got != "" {
+		t.Fatalf("PromptText() = %q, want fail-closed empty result for unprepared local resource", got)
 	}
 }
 
-func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
+func TestBridgeDoesNotRecordRejectedEphemeralResourceLinkInTranscript(t *testing.T) {
 	t.Parallel()
 
 	const attachmentURI = "file:///tmp/private-acp-input-0123456789abcdef0123456789abcdef/screen%20shot.png"
@@ -1703,26 +1701,20 @@ func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 	})
 	client.Send(promptRequest(3, "session-1", "What did you find?"))
 
-	if len(prompts) != 2 {
-		t.Fatalf("prompt count = %d, want 2", len(prompts))
-	}
-	if !strings.Contains(prompts[0], attachmentURI) {
-		t.Fatalf("first prompt = %q, want current-turn attachment URI", prompts[0])
+	if len(prompts) != 1 {
+		t.Fatalf("prompt count = %d, want only the valid follow-up", len(prompts))
 	}
 	for _, alias := range []string{attachmentURI, attachmentPath, attachmentDir, attachmentDirURI, attachmentDirBase} {
-		if strings.Contains(prompts[1], alias) {
-			t.Fatalf("second prompt = %q, must not replay ephemeral attachment alias %q", prompts[1], alias)
+		if strings.Contains(prompts[0], alias) {
+			t.Fatalf("follow-up prompt = %q, must not replay rejected attachment alias %q", prompts[0], alias)
 		}
 	}
-	if !strings.Contains(prompts[1], "Inspected [attachment path omitted] at [attachment path omitted] in [attachment path omitted] via [attachment path omitted] named [attachment path omitted]") {
-		t.Fatalf("second prompt = %q, want non-sensitive assistant transcript with path aliases removed", prompts[1])
-	}
-	if !strings.Contains(prompts[1], `Attached file "screen.png" (image/png) was provided for this turn.`) {
-		t.Fatalf("second prompt = %q, want retained attachment metadata", prompts[1])
+	if !strings.Contains(prompts[0], "What did you find?") {
+		t.Fatalf("follow-up prompt = %q", prompts[0])
 	}
 }
 
-func TestBridgeDoesNotReplayWindowsResourceLinkPathAliases(t *testing.T) {
+func TestBridgeDoesNotRecordRejectedWindowsResourceLinkInTranscript(t *testing.T) {
 	t.Parallel()
 
 	const attachmentURI = "file:///C:/Private/Stage-0123456789abcdef/screen.png"
@@ -1765,16 +1757,16 @@ func TestBridgeDoesNotReplayWindowsResourceLinkPathAliases(t *testing.T) {
 	})
 	client.Send(promptRequest(3, "session-1", "What did you find?"))
 
-	if len(prompts) != 2 {
-		t.Fatalf("prompt count = %d, want 2", len(prompts))
+	if len(prompts) != 1 {
+		t.Fatalf("prompt count = %d, want only the valid follow-up", len(prompts))
 	}
 	for _, alias := range []string{nativePath, escapedNativePath, nativeDir, nativeDirBase} {
-		if strings.Contains(strings.ToLower(prompts[1]), strings.ToLower(alias)) {
-			t.Fatalf("second prompt = %q, must not replay Windows attachment alias %q", prompts[1], alias)
+		if strings.Contains(strings.ToLower(prompts[0]), strings.ToLower(alias)) {
+			t.Fatalf("follow-up prompt = %q, must not replay rejected Windows attachment alias %q", prompts[0], alias)
 		}
 	}
-	if !strings.Contains(prompts[1], "Read [attachment path omitted] escaped [attachment path omitted] in [attachment path omitted] named [attachment path omitted]") {
-		t.Fatalf("second prompt = %q, want Windows path aliases removed", prompts[1])
+	if !strings.Contains(prompts[0], "What did you find?") {
+		t.Fatalf("follow-up prompt = %q", prompts[0])
 	}
 }
 
