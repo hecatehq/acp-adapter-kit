@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -121,6 +122,8 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
 	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	configureProcessUnit(cmd)
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdout = stdout
@@ -178,13 +181,26 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 		return Result{}, err
 	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stdout := &streamingBuffer{
 		buffer: newLimitedBuffer(limitOrDefault(spec.StdoutLimit)),
-		stream: onStdout,
+		stream: func(chunk []byte) error {
+			if onStdout == nil {
+				return nil
+			}
+			if err := onStdout(chunk); err != nil {
+				cancel()
+				return err
+			}
+			return nil
+		},
 	}
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
-	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	cmd := exec.CommandContext(runCtx, resolved, spec.Args...)
+	configureProcessUnit(cmd)
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdout = stdout
@@ -248,6 +264,8 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, resolved, spec.Args...)
+	configureProcessUnit(cmd)
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
 	cmd.Env = env
 
@@ -295,10 +313,20 @@ func (c *Child) Kill() error {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
 		return nil
 	}
-	if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	if err := cancelProcessUnit(c.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
 	return nil
+}
+
+func cancelProcessUnit(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	if cmd.Cancel != nil {
+		return cmd.Cancel()
+	}
+	return cmd.Process.Kill()
 }
 
 func (c *Child) Wait() error {
