@@ -1,6 +1,8 @@
 module github.com/hecatehq/acp-adapter-kit
 
-go 1.24
+go 1.24.0
+
+toolchain go1.24.5
 
 require (
 	github.com/coder/acp-go-sdk v0.13.5
