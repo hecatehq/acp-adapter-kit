@@ -1584,8 +1584,11 @@ func TestPromptTextIncludesResourceLinkAttachments(t *testing.T) {
 func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 	t.Parallel()
 
-	const attachmentURI = "file:///tmp/private-turn/screen%20shot.png"
-	const attachmentPath = "/tmp/private-turn/screen shot.png"
+	const attachmentURI = "file:///tmp/private-acp-input-0123456789abcdef0123456789abcdef/screen%20shot.png"
+	const attachmentPath = "/tmp/private-acp-input-0123456789abcdef0123456789abcdef/screen shot.png"
+	const attachmentDir = "/tmp/private-acp-input-0123456789abcdef0123456789abcdef"
+	const attachmentDirURI = "file:///tmp/private-acp-input-0123456789abcdef0123456789abcdef"
+	const attachmentDirBase = "private-acp-input-0123456789abcdef0123456789abcdef"
 	var prompts []string
 	var runCount int
 	bridge := commandbridge.New(commandbridge.Spec{
@@ -1602,7 +1605,7 @@ func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 		Runner: commandbridge.RunnerFunc(func(_ context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
 			runCount++
 			if runCount == 1 {
-				return adapterprocess.Result{Stdout: []byte("Inspected " + attachmentURI + " at " + attachmentPath)}, nil
+				return adapterprocess.Result{Stdout: []byte("Inspected " + attachmentURI + " at " + attachmentPath + " in " + attachmentDir + " via " + attachmentDirURI + " named " + attachmentDirBase)}, nil
 			}
 			return adapterprocess.Result{Stdout: []byte("ok")}, nil
 		}),
@@ -1635,17 +1638,72 @@ func TestBridgeDoesNotReplayEphemeralResourceLinkURIInTranscript(t *testing.T) {
 	if !strings.Contains(prompts[0], attachmentURI) {
 		t.Fatalf("first prompt = %q, want current-turn attachment URI", prompts[0])
 	}
-	if strings.Contains(prompts[1], attachmentURI) {
-		t.Fatalf("second prompt = %q, must not replay ephemeral attachment URI", prompts[1])
+	for _, alias := range []string{attachmentURI, attachmentPath, attachmentDir, attachmentDirURI, attachmentDirBase} {
+		if strings.Contains(prompts[1], alias) {
+			t.Fatalf("second prompt = %q, must not replay ephemeral attachment alias %q", prompts[1], alias)
+		}
 	}
-	if strings.Contains(prompts[1], attachmentPath) {
-		t.Fatalf("second prompt = %q, must not replay decoded attachment path", prompts[1])
-	}
-	if !strings.Contains(prompts[1], "Inspected [attachment path omitted] at [attachment path omitted]") {
+	if !strings.Contains(prompts[1], "Inspected [attachment path omitted] at [attachment path omitted] in [attachment path omitted] via [attachment path omitted] named [attachment path omitted]") {
 		t.Fatalf("second prompt = %q, want non-sensitive assistant transcript with path aliases removed", prompts[1])
 	}
 	if !strings.Contains(prompts[1], `Attached file "screen.png" (image/png) was provided for this turn.`) {
 		t.Fatalf("second prompt = %q, want retained attachment metadata", prompts[1])
+	}
+}
+
+func TestBridgeDoesNotReplayWindowsResourceLinkPathAliases(t *testing.T) {
+	t.Parallel()
+
+	const attachmentURI = "file:///C:/Private/Stage-0123456789abcdef/screen.png"
+	const nativePath = `c:\PRIVATE\stage-0123456789ABCDEF\screen.png`
+	const escapedNativePath = `C:\\Private\\Stage-0123456789abcdef\\screen.png`
+	const nativeDir = `C:\private\STAGE-0123456789abcdef`
+	const nativeDirBase = "stage-0123456789ABCDEF"
+	var prompts []string
+	var runCount int
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:             func() string { return "session-1" },
+		IncludeTranscript: true,
+		BuildPrompt: func(_ commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			text, err := commandbridge.RequirePromptText(params)
+			if err != nil {
+				return adapterprocess.Spec{}, err
+			}
+			prompts = append(prompts, text)
+			return adapterprocess.Spec{Command: "agent", Dir: "/tmp"}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(_ context.Context, _ adapterprocess.Spec) (adapterprocess.Result, error) {
+			runCount++
+			if runCount == 1 {
+				return adapterprocess.Result{Stdout: []byte("Read " + nativePath + " escaped " + escapedNativePath + " in " + nativeDir + " named " + nativeDirBase)}, nil
+			}
+			return adapterprocess.Result{Stdout: []byte("ok")}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{"cwd": "/tmp"})
+	client.Send(map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+		"params": map[string]any{
+			"sessionId": "session-1",
+			"prompt": []map[string]any{
+				{"type": "text", "text": "Inspect the input."},
+				{"type": "resource_link", "name": "screen.png", "mimeType": "image/png", "uri": attachmentURI},
+			},
+		},
+	})
+	client.Send(promptRequest(3, "session-1", "What did you find?"))
+
+	if len(prompts) != 2 {
+		t.Fatalf("prompt count = %d, want 2", len(prompts))
+	}
+	for _, alias := range []string{nativePath, escapedNativePath, nativeDir, nativeDirBase} {
+		if strings.Contains(strings.ToLower(prompts[1]), strings.ToLower(alias)) {
+			t.Fatalf("second prompt = %q, must not replay Windows attachment alias %q", prompts[1], alias)
+		}
+	}
+	if !strings.Contains(prompts[1], "Read [attachment path omitted] escaped [attachment path omitted] in [attachment path omitted] named [attachment path omitted]") {
+		t.Fatalf("second prompt = %q, want Windows path aliases removed", prompts[1])
 	}
 }
 

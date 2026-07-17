@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1321,19 +1322,86 @@ func transcriptPromptText(params runtimeacp.PromptParams) string {
 func sanitizeTranscriptAssistantText(params runtimeacp.PromptParams, text string) string {
 	aliases := resourceLinkAliases(params)
 	for _, alias := range aliases {
-		text = strings.ReplaceAll(text, alias, "[attachment path omitted]")
+		text = replaceAllResourceLinkAlias(text, alias, "[attachment path omitted]")
 	}
 	return text
 }
 
+func replaceAllResourceLinkAlias(value, alias, replacement string) string {
+	if value == "" || alias == "" || len(alias) > len(value) {
+		return value
+	}
+	var out strings.Builder
+	matched := false
+	for offset := 0; offset < len(value); {
+		if offset+len(alias) <= len(value) && resourceLinkAliasEqual(value[offset:offset+len(alias)], alias) {
+			if !matched {
+				out.Grow(len(value))
+			}
+			out.WriteString(replacement)
+			offset += len(alias)
+			matched = true
+			continue
+		}
+		out.WriteByte(value[offset])
+		offset++
+	}
+	if !matched {
+		return value
+	}
+	return out.String()
+}
+
+func resourceLinkAliasEqual(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = strings.ReplaceAll(left, `\`, "/")
+	right = strings.ReplaceAll(right, `\`, "/")
+	return strings.EqualFold(left, right)
+}
+
 func resourceLinkAliases(params runtimeacp.PromptParams) []string {
 	seen := map[string]struct{}{}
-	add := func(value string) {
+	addRaw := func(value string) {
 		value = strings.TrimSpace(value)
 		if value == "" || value == "." || value == "/" {
 			return
 		}
 		seen[value] = struct{}{}
+	}
+	add := func(value string) {
+		addRaw(value)
+		if encoded, err := json.Marshal(strings.TrimSpace(value)); err == nil && len(encoded) >= 2 {
+			addRaw(string(encoded[1 : len(encoded)-1]))
+		}
+	}
+	addPath := func(value string) {
+		value = strings.TrimSpace(value)
+		add(value)
+		add(filepath.FromSlash(value))
+		add(strings.ReplaceAll(value, "/", `\`))
+		if len(value) >= 3 && value[0] == '/' && isASCIILetter(value[1]) && value[2] == ':' {
+			drivePath := value[1:]
+			add(drivePath)
+			add(strings.ReplaceAll(drivePath, "/", `\`))
+		}
+	}
+	addPathAndParent := func(value string) {
+		value = strings.TrimSpace(value)
+		addPath(value)
+		parent := pathpkg.Dir(strings.ReplaceAll(value, `\`, "/"))
+		if parent == "." || parent == "/" {
+			return
+		}
+		addPath(parent)
+		add(pathpkg.Base(parent))
+		if len(parent) >= 3 && parent[0] == '/' && isASCIILetter(parent[1]) && parent[2] == ':' {
+			driveParent := parent[1:]
+			add(driveParent)
+			add(strings.ReplaceAll(driveParent, "/", `\`))
+			add(pathpkg.Base(driveParent))
+		}
 	}
 	for _, block := range params.Prompt {
 		if block.Type != "resource_link" {
@@ -1346,13 +1414,22 @@ func resourceLinkAliases(params runtimeacp.PromptParams) []string {
 			continue
 		}
 		for _, path := range []string{parsed.Path, parsed.EscapedPath()} {
-			add(path)
-			add(filepath.FromSlash(path))
+			addPathAndParent(path)
 			if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
 				uncPath := "//" + parsed.Host + path
-				add(uncPath)
-				add(filepath.FromSlash(uncPath))
+				addPathAndParent(uncPath)
 			}
+		}
+		parentPath := pathpkg.Dir(parsed.Path)
+		if parentPath != "." && parentPath != "/" {
+			parentURI := *parsed
+			parentURI.Path = parentPath
+			parentURI.RawPath = ""
+			parentURI.RawQuery = ""
+			parentURI.ForceQuery = false
+			parentURI.Fragment = ""
+			parentURI.RawFragment = ""
+			add(parentURI.String())
 		}
 	}
 	aliases := make([]string, 0, len(seen))
@@ -1360,9 +1437,16 @@ func resourceLinkAliases(params runtimeacp.PromptParams) []string {
 		aliases = append(aliases, alias)
 	}
 	sort.Slice(aliases, func(i, j int) bool {
+		if len(aliases[i]) == len(aliases[j]) {
+			return aliases[i] < aliases[j]
+		}
 		return len(aliases[i]) > len(aliases[j])
 	})
 	return aliases
+}
+
+func isASCIILetter(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
 }
 
 func renderPromptText(params runtimeacp.PromptParams, includeResourceLinkURI bool) string {
