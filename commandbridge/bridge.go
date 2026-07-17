@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -497,7 +498,7 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 		return nil, &acp.RPCError{Code: -32000, Message: "prompt command failed", Data: data}
 	}
 	b.recordPromptSuccess(req.SessionID)
-	if info, ok := b.recordTranscriptExchange(req.SessionID, transcriptPromptText(req), assistantText); ok {
+	if info, ok := b.recordTranscriptExchange(req.SessionID, transcriptPromptText(req), sanitizeTranscriptAssistantText(req, assistantText)); ok {
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
@@ -1315,6 +1316,53 @@ func PromptText(params runtimeacp.PromptParams) string {
 
 func transcriptPromptText(params runtimeacp.PromptParams) string {
 	return renderPromptText(params, false)
+}
+
+func sanitizeTranscriptAssistantText(params runtimeacp.PromptParams, text string) string {
+	aliases := resourceLinkAliases(params)
+	for _, alias := range aliases {
+		text = strings.ReplaceAll(text, alias, "[attachment path omitted]")
+	}
+	return text
+}
+
+func resourceLinkAliases(params runtimeacp.PromptParams) []string {
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "." || value == "/" {
+			return
+		}
+		seen[value] = struct{}{}
+	}
+	for _, block := range params.Prompt {
+		if block.Type != "resource_link" {
+			continue
+		}
+		raw := strings.TrimSpace(block.URI)
+		add(raw)
+		parsed, err := url.Parse(raw)
+		if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
+			continue
+		}
+		for _, path := range []string{parsed.Path, parsed.EscapedPath()} {
+			add(path)
+			add(filepath.FromSlash(path))
+			if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+				uncPath := "//" + parsed.Host + path
+				add(uncPath)
+				add(filepath.FromSlash(uncPath))
+			}
+		}
+	}
+	aliases := make([]string, 0, len(seen))
+	for alias := range seen {
+		aliases = append(aliases, alias)
+	}
+	sort.Slice(aliases, func(i, j int) bool {
+		return len(aliases[i]) > len(aliases[j])
+	})
+	return aliases
 }
 
 func renderPromptText(params runtimeacp.PromptParams, includeResourceLinkURI bool) string {
