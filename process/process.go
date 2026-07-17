@@ -150,7 +150,7 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 	if errors.As(err, &exitErr) {
 		return result, &ExitError{Command: resolved, Code: exitErr.ExitCode(), Stderr: result.Stderr}
 	}
-	if os.IsNotExist(err) {
+	if isCommandNotFound(err) {
 		return result, &CommandNotFoundError{Command: spec.Command, Err: err}
 	}
 	return result, fmt.Errorf("run process %q: %w", resolved, err)
@@ -232,7 +232,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 	if errors.As(runErr, &exitErr) {
 		return result, &ExitError{Command: resolved, Code: exitErr.ExitCode(), Stderr: result.Stderr}
 	}
-	if os.IsNotExist(runErr) {
+	if isCommandNotFound(runErr) {
 		return result, &CommandNotFoundError{Command: spec.Command, Err: runErr}
 	}
 	return result, fmt.Errorf("run process %q: %w", resolved, runErr)
@@ -295,7 +295,7 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	if err := startProcessUnit(ctx, cmd); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
-		if os.IsNotExist(err) {
+		if isCommandNotFound(err) {
 			return nil, &CommandNotFoundError{Command: spec.Command, Err: err}
 		}
 		return nil, fmt.Errorf("start process %q: %w", resolved, err)
@@ -313,6 +313,10 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 		stderr:          stderr,
 		stopCancelWatch: stopCancelWatch,
 	}, nil
+}
+
+func isCommandNotFound(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, exec.ErrNotFound)
 }
 
 func (c *Child) PID() int {
