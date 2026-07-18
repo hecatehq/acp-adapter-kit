@@ -10,7 +10,7 @@ import (
 )
 
 func TestAssertUpstreamParityContract(t *testing.T) {
-	AssertUpstreamParityContract(t, parityServer(false), UpstreamParityContract{
+	AssertUpstreamParityContract(t, parityServer(false, true), UpstreamParityContract{
 		CWD:          t.TempDir(),
 		AuthMethodID: "agent-login",
 		ConfigChange: ConfigChangeContract{
@@ -26,7 +26,7 @@ func TestAssertUpstreamParityContract(t *testing.T) {
 }
 
 func TestAssertUpstreamParityContractAdoptsUnknownSessions(t *testing.T) {
-	AssertUpstreamParityContract(t, parityServer(true), UpstreamParityContract{
+	AssertUpstreamParityContract(t, parityServer(true, true), UpstreamParityContract{
 		CWD:          t.TempDir(),
 		AuthMethodID: "agent-login",
 		ConfigChange: ConfigChangeContract{
@@ -41,8 +41,21 @@ func TestAssertUpstreamParityContractAdoptsUnknownSessions(t *testing.T) {
 	})
 }
 
-func parityServer(loadUnknownSessions bool) *acp.Server {
-	bridge := commandbridge.New(commandbridge.Spec{
+func TestAssertUpstreamParityContractAllowsDynamicCommandDiscovery(t *testing.T) {
+	AssertUpstreamParityContract(t, parityServer(false, false), UpstreamParityContract{
+		CWD:                          t.TempDir(),
+		AuthMethodID:                 "agent-login",
+		AllowDynamicCommandDiscovery: true,
+		LoadUnknownSession: LoadUnknownSessionContract{
+			SessionID: "missing-session",
+			CWD:       t.TempDir(),
+			Allowed:   false,
+		},
+	})
+}
+
+func parityServer(loadUnknownSessions, includeBootstrapCommands bool) *acp.Server {
+	spec := commandbridge.Spec{
 		LoadUnknownSessions: loadUnknownSessions,
 		AuthMethods: []acp.AuthMethod{{
 			ID:   "agent-login",
@@ -58,10 +71,6 @@ func parityServer(loadUnknownSessions bool) *acp.Server {
 				{Value: "smart", Name: "Smart"},
 			},
 		}},
-		Commands: []commandbridge.AvailableCommand{{
-			Name:      "review",
-			InputHint: "optional focus",
-		}},
 		BuildAuthenticate: func(string) (adapterprocess.Spec, error) {
 			return adapterprocess.Spec{Command: "agent", Args: []string{"login"}}, nil
 		},
@@ -71,7 +80,14 @@ func parityServer(loadUnknownSessions bool) *acp.Server {
 		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
 			return adapterprocess.Result{}, nil
 		}),
-	})
+	}
+	if includeBootstrapCommands {
+		spec.Commands = []commandbridge.AvailableCommand{{
+			Name:      "review",
+			InputHint: "optional focus",
+		}}
+	}
+	bridge := commandbridge.New(spec)
 	return acp.NewServer(acp.AdapterInfo{
 		Name:    "parity-agent",
 		Title:   "Parity Agent",

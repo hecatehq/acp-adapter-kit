@@ -77,6 +77,17 @@ func (c *MethodContext) Context() context.Context {
 	return c.ctx
 }
 
+// ConnectionContext is cancelled when the peer transport closes. Unlike
+// Context, it remains live after the inbound method has returned, so adapter
+// work that outlives a single request can still stop promptly when no ACP peer
+// remains to receive its result.
+func (c *MethodContext) ConnectionContext() context.Context {
+	if c == nil || c.conn == nil || c.conn.lifetimeCtx == nil {
+		return context.Background()
+	}
+	return c.conn.lifetimeCtx
+}
+
 func (c *MethodContext) Notify(method string, params any) error {
 	if c == nil || c.conn == nil {
 		return errors.New("method context is not connected")
@@ -202,6 +213,8 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 		return errors.New("output is required")
 	}
 
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	defer lifetimeCancel()
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxMessageBytes)
 	conn := &connection{
@@ -212,6 +225,8 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 		queued:           map[string]struct{}{},
 		active:           map[string]context.CancelFunc{},
 		cancelled:        map[string]struct{}{},
+		lifetimeCtx:      lifetimeCtx,
+		lifetimeCancel:   lifetimeCancel,
 	}
 	handlerErr := make(chan error, 1)
 	sendHandlerErr := func(err error) {
@@ -549,6 +564,8 @@ type connection struct {
 	cancelled        map[string]struct{}
 	closed           bool
 	closeErr         error
+	lifetimeCtx      context.Context
+	lifetimeCancel   context.CancelFunc
 }
 
 type clientResponse struct {
@@ -780,9 +797,13 @@ func (c *connection) finishRequests(err error) {
 	}
 	c.closed = true
 	c.closeErr = err
+	lifetimeCancel := c.lifetimeCancel
 	pending := c.pending
 	c.pending = map[string]chan clientResponse{}
 	c.requestMu.Unlock()
+	if lifetimeCancel != nil {
+		lifetimeCancel()
+	}
 	for _, resultCh := range pending {
 		resultCh <- clientResponse{err: err}
 	}

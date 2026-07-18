@@ -14,6 +14,10 @@ type UpstreamParityContract struct {
 	AuthMethodID       string
 	ConfigChange       ConfigChangeContract
 	LoadUnknownSession LoadUnknownSessionContract
+	// AllowDynamicCommandDiscovery permits adapters whose authoritative command
+	// inventory arrives asynchronously after session/new instead of as a
+	// synchronous bootstrap notification.
+	AllowDynamicCommandDiscovery bool
 }
 
 type ConfigChangeContract struct {
@@ -41,7 +45,7 @@ func AssertUpstreamParityContract(t testing.TB, server *acp.Server, want Upstrea
 	}
 
 	client := acptest.NewClient(t, server)
-	created := assertSessionNewParity(t, client, want.CWD)
+	created := assertSessionNewParity(t, client, want.CWD, want.AllowDynamicCommandDiscovery)
 	sessionID := created.SessionID
 	if sessionID == "" {
 		t.Fatal("session/new sessionId is empty")
@@ -71,7 +75,7 @@ type parityConfigOption struct {
 	} `json:"options"`
 }
 
-func assertSessionNewParity(t testing.TB, client *acptest.Client, cwd string) paritySession {
+func assertSessionNewParity(t testing.TB, client *acptest.Client, cwd string, allowDynamicCommands bool) paritySession {
 	t.Helper()
 	responses := client.Send(map[string]any{
 		"jsonrpc": "2.0",
@@ -99,12 +103,15 @@ func assertSessionNewParity(t testing.TB, client *acptest.Client, cwd string) pa
 		response.ParamsInto(t, &update)
 		if update.SessionID != "" && update.Update.SessionUpdate == "available_commands_update" {
 			if len(update.Update.AvailableCommands) == 0 {
-				t.Fatalf("available_commands_update = %#v, want at least one command", update)
+				if !allowDynamicCommands {
+					t.Fatalf("available_commands_update = %#v, want at least one command", update)
+				}
+				continue
 			}
 			sawCommands = true
 		}
 	}
-	if !sawCommands {
+	if !sawCommands && !allowDynamicCommands {
 		t.Fatalf("session/new responses = %#v, want available_commands_update before result", responses)
 	}
 	var created paritySession

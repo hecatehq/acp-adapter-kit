@@ -28,6 +28,20 @@ type StreamRunner interface {
 	RunStream(context.Context, adapterprocess.Spec, func([]byte) error) (adapterprocess.Result, error)
 }
 
+// CommandStarter starts a fixed-argv provider process for a short-lived
+// command discovery exchange. Hosts that own provider process boundaries
+// should implement it alongside Runner so discovery uses the same resolved
+// binary and allowlisted environment as prompt execution.
+type CommandStarter interface {
+	Start(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error)
+}
+
+// CommandDiscoverer returns the complete current provider command snapshot
+// for one ACP session. It runs asynchronously and must respect ctx; errors
+// are intentionally non-fatal because an unavailable catalog must never make
+// a healthy agent session unusable.
+type CommandDiscoverer func(context.Context, CommandDiscoverySession, CommandStarter) ([]AvailableCommand, error)
+
 type RunnerFunc func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error)
 
 func (f RunnerFunc) Run(ctx context.Context, spec adapterprocess.Spec) (adapterprocess.Result, error) {
@@ -66,6 +80,13 @@ func (r ProcessRunner) RunStream(ctx context.Context, spec adapterprocess.Spec, 
 	return adapterprocess.RunStreamWithBaseEnv(ctx, spec, r.baseEnv, onStdout)
 }
 
+func (r ProcessRunner) Start(ctx context.Context, spec adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+	if !r.baseEnvSet {
+		return adapterprocess.Start(ctx, spec)
+	}
+	return adapterprocess.StartWithBaseEnv(ctx, spec, r.baseEnv)
+}
+
 type PromptCommandBuilder func(Session, runtimeacp.PromptParams) (adapterprocess.Spec, error)
 
 type AuthenticateCommandBuilder func(methodID string) (adapterprocess.Spec, error)
@@ -91,14 +112,23 @@ const (
 type PromptFailureClassifier func(Session, adapterprocess.Spec, adapterprocess.Result, error) PromptFailureKind
 
 type Spec struct {
-	Runner Runner
+	Runner         Runner
+	CommandStarter CommandStarter
+	// DiscoverCommands publishes a replacement provider command snapshot after
+	// session lifecycle changes. It is optional: static Commands remain useful
+	// for runtimes without an authoritative discovery surface.
+	DiscoverCommands        CommandDiscoverer
+	CommandDiscoveryTimeout time.Duration
 	// NewID overrides the default cryptographically random ACP session id.
 	// Custom generators must return a non-empty id that remains unique across
 	// adapter process restarts.
-	NewID                  func() string
-	LoadUnknownSessions    bool
-	AuthMethods            []acp.AuthMethod
-	Options                []SelectConfigOption
+	NewID               func() string
+	LoadUnknownSessions bool
+	AuthMethods         []acp.AuthMethod
+	Options             []SelectConfigOption
+	// Commands is an optional bootstrap snapshot. When DiscoverCommands is
+	// configured, its later result replaces this list rather than extending or
+	// filtering it.
 	Commands               []AvailableCommand
 	IncludeTranscript      bool
 	MaxTranscriptExchanges int
@@ -123,9 +153,14 @@ type Bridge struct {
 
 	nextID atomic.Int64
 
-	mu       sync.Mutex
-	sessions map[string]*sessionState
-	active   map[string]*activePrompt
+	mu                      sync.Mutex
+	commandDiscoveryMu      sync.Mutex
+	sessions                map[string]*sessionState
+	active                  map[string]*activePrompt
+	commandDiscoveries      map[string]commandDiscovery
+	commandPublications     map[string]*commandPublication
+	commandPublisherRunning bool
+	discoveryGeneration     uint64
 
 	promptResourceCleanupHook func(string) error
 	promptMethodContext       func(*acp.MethodContext) context.Context
@@ -135,6 +170,20 @@ type Bridge struct {
 type activePrompt struct {
 	cancel    context.CancelFunc
 	finalized bool
+}
+
+type commandDiscovery struct {
+	cancel     context.CancelFunc
+	generation uint64
+}
+
+type commandPublication struct {
+	pending *commandSnapshot
+}
+
+type commandSnapshot struct {
+	methodCtx *acp.MethodContext
+	commands  []AvailableCommand
 }
 
 type Session struct {
@@ -151,6 +200,18 @@ type Session struct {
 	PromptCount int
 	// Adopted is true when the bridge adopted a host-known session ID via load/resume.
 	Adopted bool
+}
+
+// CommandDiscoverySession is the minimized, immutable session view supplied
+// to a provider command discovery callback. It deliberately omits MCP server
+// configuration, including connection headers and environment values, because
+// command discovery must not start or inspect MCP runtimes.
+type CommandDiscoverySession struct {
+	ID                    string
+	CWD                   string
+	AdditionalDirectories []string
+	Config                map[string]string
+	ModeID                string
 }
 
 type SelectConfigOption struct {
@@ -190,18 +251,26 @@ type sessionInfo struct {
 }
 
 const (
-	defaultMaxTranscriptExchanges = 8
-	toolOutputPreviewLimit        = 8 * 1024
+	defaultMaxTranscriptExchanges  = 8
+	toolOutputPreviewLimit         = 8 * 1024
+	defaultCommandDiscoveryTimeout = 15 * time.Second
 )
 
 func New(spec Spec) *Bridge {
 	if spec.Runner == nil {
 		spec.Runner = ProcessRunner{}
 	}
+	if spec.CommandStarter == nil {
+		if starter, ok := spec.Runner.(CommandStarter); ok {
+			spec.CommandStarter = starter
+		}
+	}
 	return &Bridge{
-		spec:     spec,
-		sessions: map[string]*sessionState{},
-		active:   map[string]*activePrompt{},
+		spec:                spec,
+		sessions:            map[string]*sessionState{},
+		active:              map[string]*activePrompt{},
+		commandDiscoveries:  map[string]commandDiscovery{},
+		commandPublications: map[string]*commandPublication{},
 	}
 }
 
@@ -254,6 +323,7 @@ func (b *Bridge) authenticate(ctx *acp.MethodContext, params json.RawMessage) (a
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "authenticate command failed", Data: commandErrorData(result, err)}
 	}
+	b.scheduleAllCommandDiscoveries(ctx)
 	return map[string]any{}, nil
 }
 
@@ -284,6 +354,7 @@ func (b *Bridge) logout(ctx *acp.MethodContext, params json.RawMessage) (any, *a
 	if err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "logout command failed", Data: commandErrorData(result, err)}
 	}
+	b.scheduleAllCommandDiscoveries(ctx)
 	return map[string]any{}, nil
 }
 
@@ -312,6 +383,7 @@ func (b *Bridge) newSession(ctx *acp.MethodContext, params json.RawMessage) (any
 	if err := b.notifyAvailableCommands(ctx, id); err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
 	}
+	b.scheduleCommandDiscovery(ctx, cloneSession(state.Session))
 	return map[string]any{
 		"sessionId":     id,
 		"configOptions": b.configOptions(state),
@@ -350,6 +422,7 @@ func (b *Bridge) forkSession(ctx *acp.MethodContext, params json.RawMessage) (an
 	if err := b.notifyAvailableCommands(ctx, id); err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
 	}
+	b.scheduleCommandDiscovery(ctx, cloneSession(state.Session))
 	return map[string]any{
 		"sessionId":     id,
 		"configOptions": b.configOptions(state),
@@ -368,6 +441,7 @@ func (b *Bridge) loadSession(ctx *acp.MethodContext, params json.RawMessage) (an
 	if err := b.notifyAvailableCommands(ctx, req.SessionID); err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
 	}
+	b.scheduleCommandDiscovery(ctx, cloneSession(state.Session))
 	return map[string]any{"configOptions": b.configOptions(state)}, nil
 }
 
@@ -383,6 +457,7 @@ func (b *Bridge) resumeSession(ctx *acp.MethodContext, params json.RawMessage) (
 	if err := b.notifyAvailableCommands(ctx, req.SessionID); err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "available command notification failed", Data: err.Error()}
 	}
+	b.scheduleCommandDiscovery(ctx, cloneSession(state.Session))
 	return map[string]any{"configOptions": b.configOptions(state)}, nil
 }
 
@@ -449,26 +524,31 @@ func (b *Bridge) setConfigOption(ctx *acp.MethodContext, params json.RawMessage)
 	state.Config[req.ConfigID] = req.Value
 	state.UpdatedAt = b.now()
 	configOptions := b.configOptions(state)
+	session := cloneSession(state.Session)
 	b.mu.Unlock()
 	if err := notifyConfigOptions(ctx, req.SessionID, configOptions); err != nil {
 		return nil, &acp.RPCError{Code: -32000, Message: "config option notification failed", Data: err.Error()}
 	}
+	b.scheduleCommandDiscovery(ctx, session)
 	return map[string]any{"configOptions": configOptions}, nil
 }
 
-func (b *Bridge) setMode(_ *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
+func (b *Bridge) setMode(ctx *acp.MethodContext, params json.RawMessage) (any, *acp.RPCError) {
 	var req runtimeacp.SetModeParams
 	if rpcErr := decodeParams(params, &req); rpcErr != nil {
 		return nil, rpcErr
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	state := b.sessions[req.SessionID]
 	if state == nil {
+		b.mu.Unlock()
 		return nil, notFound("session not found", req.SessionID)
 	}
 	state.ModeID = req.ModeID
 	state.UpdatedAt = b.now()
+	session := cloneSession(state.Session)
+	b.mu.Unlock()
+	b.scheduleCommandDiscovery(ctx, session)
 	return map[string]any{}, nil
 }
 
@@ -595,6 +675,9 @@ func (b *Bridge) prompt(ctx *acp.MethodContext, params json.RawMessage) (respons
 		if err := notifySessionInfo(ctx, req.SessionID, info); err != nil {
 			return nil, &acp.RPCError{Code: -32000, Message: "session info notification failed", Data: err.Error()}
 		}
+	}
+	if state, sessionErr := b.session(req.SessionID); sessionErr == nil {
+		b.scheduleCommandDiscovery(ctx, state.Session)
 	}
 	stopReason := runtimeacp.StopReasonEndTurn
 	if parser != nil {
@@ -1229,10 +1312,7 @@ func (b *Bridge) closeSession(_ *acp.MethodContext, params json.RawMessage) (any
 	if rpcErr := decodeParams(params, &req); rpcErr != nil {
 		return nil, rpcErr
 	}
-	b.cancel(req.SessionID)
-	b.mu.Lock()
-	delete(b.sessions, req.SessionID)
-	b.mu.Unlock()
+	b.removeSession(req.SessionID)
 	return map[string]any{}, nil
 }
 
@@ -1241,11 +1321,26 @@ func (b *Bridge) deleteSession(_ *acp.MethodContext, params json.RawMessage) (an
 	if rpcErr := decodeParams(params, &req); rpcErr != nil {
 		return nil, rpcErr
 	}
-	b.cancel(req.SessionID)
-	b.mu.Lock()
-	delete(b.sessions, req.SessionID)
-	b.mu.Unlock()
+	b.removeSession(req.SessionID)
 	return map[string]any{}, nil
+}
+
+func (b *Bridge) removeSession(sessionID string) {
+	b.cancel(sessionID)
+	b.commandDiscoveryMu.Lock()
+	b.mu.Lock()
+	discovery, ok := b.commandDiscoveries[sessionID]
+	delete(b.commandDiscoveries, sessionID)
+	if publication := b.commandPublications[sessionID]; publication != nil {
+		publication.pending = nil
+		delete(b.commandPublications, sessionID)
+	}
+	delete(b.sessions, sessionID)
+	b.mu.Unlock()
+	b.commandDiscoveryMu.Unlock()
+	if ok && discovery.cancel != nil {
+		discovery.cancel()
+	}
 }
 
 func (b *Bridge) session(id string) (*sessionState, *acp.RPCError) {
@@ -1309,11 +1404,12 @@ func (b *Bridge) rebindSession(id, cwd string, additionalDirectories []string, m
 }
 
 func (b *Bridge) notifyAvailableCommands(ctx *acp.MethodContext, sessionID string) error {
-	if len(b.spec.Commands) == 0 {
-		return nil
-	}
-	commands := make([]map[string]any, 0, len(b.spec.Commands))
-	for _, command := range b.spec.Commands {
+	return notifyAvailableCommandSnapshot(ctx, sessionID, b.spec.Commands, false)
+}
+
+func notifyAvailableCommandSnapshot(ctx *acp.MethodContext, sessionID string, available []AvailableCommand, emitEmpty bool) error {
+	commands := make([]map[string]any, 0, len(available))
+	for _, command := range available {
 		name := strings.TrimSpace(command.Name)
 		if name == "" {
 			continue
@@ -1331,7 +1427,7 @@ func (b *Bridge) notifyAvailableCommands(ctx *acp.MethodContext, sessionID strin
 		}
 		commands = append(commands, item)
 	}
-	if len(commands) == 0 {
+	if len(commands) == 0 && !emitEmpty {
 		return nil
 	}
 	return ctx.Notify("session/update", map[string]any{
@@ -1341,6 +1437,169 @@ func (b *Bridge) notifyAvailableCommands(ctx *acp.MethodContext, sessionID strin
 			"availableCommands": commands,
 		},
 	})
+}
+
+// scheduleCommandDiscovery refreshes an optional provider-owned command
+// catalog without putting session creation, configuration changes, or a
+// successful prompt on the critical path. A later session mutation or close
+// supersedes an in-flight discovery. Failures are intentionally silent: ACP
+// command suggestions are an enhancement and must not make a usable session
+// fail.
+func (b *Bridge) scheduleCommandDiscovery(methodCtx *acp.MethodContext, session Session) {
+	discover := b.spec.DiscoverCommands
+	starter := b.spec.CommandStarter
+	if discover == nil || starter == nil || methodCtx == nil || strings.TrimSpace(session.ID) == "" {
+		return
+	}
+
+	connectionCtx := methodCtx.ConnectionContext()
+	if err := connectionCtx.Err(); err != nil {
+		return
+	}
+	discoveryCtx, cancel := context.WithTimeout(connectionCtx, b.commandDiscoveryTimeout())
+	discoverySession := newCommandDiscoverySession(session)
+
+	// The discovery mutex orders session mutations with publication selection,
+	// but never covers transport I/O. The bridge-owned bounded publisher writes
+	// after this lock has been released so a blocked peer cannot prevent a newer
+	// lifecycle operation from cancelling or closing the session.
+	b.commandDiscoveryMu.Lock()
+	b.mu.Lock()
+	if _, sessionExists := b.sessions[discoverySession.ID]; !sessionExists {
+		b.mu.Unlock()
+		b.commandDiscoveryMu.Unlock()
+		cancel()
+		return
+	}
+	if publication := b.commandPublications[discoverySession.ID]; publication != nil {
+		// A not-yet-written snapshot is stale as soon as the session changes.
+		publication.pending = nil
+	}
+	previous, hadPrevious := b.commandDiscoveries[discoverySession.ID]
+	b.discoveryGeneration++
+	generation := b.discoveryGeneration
+	b.commandDiscoveries[discoverySession.ID] = commandDiscovery{cancel: cancel, generation: generation}
+	b.mu.Unlock()
+	b.commandDiscoveryMu.Unlock()
+	if hadPrevious && previous.cancel != nil {
+		previous.cancel()
+	}
+
+	go func() {
+		defer cancel()
+		commands, err := discover(discoveryCtx, discoverySession, starter)
+		if err != nil || discoveryCtx.Err() != nil {
+			b.finishCommandDiscovery(discoverySession.ID, generation)
+			return
+		}
+		b.publishDiscoveredCommands(discoverySession.ID, generation, methodCtx, commands)
+	}()
+}
+
+func (b *Bridge) scheduleAllCommandDiscoveries(methodCtx *acp.MethodContext) {
+	if b == nil || methodCtx == nil {
+		return
+	}
+	b.mu.Lock()
+	sessions := make([]Session, 0, len(b.sessions))
+	for _, state := range b.sessions {
+		sessions = append(sessions, cloneSession(state.Session))
+	}
+	b.mu.Unlock()
+	for _, session := range sessions {
+		b.scheduleCommandDiscovery(methodCtx, session)
+	}
+}
+
+func (b *Bridge) publishDiscoveredCommands(sessionID string, generation uint64, methodCtx *acp.MethodContext, commands []AvailableCommand) {
+	b.commandDiscoveryMu.Lock()
+	b.mu.Lock()
+	current, currentOK := b.commandDiscoveries[sessionID]
+	_, sessionOK := b.sessions[sessionID]
+	if !currentOK || current.generation != generation || !sessionOK {
+		b.mu.Unlock()
+		b.commandDiscoveryMu.Unlock()
+		return
+	}
+	delete(b.commandDiscoveries, sessionID)
+	publication := b.commandPublications[sessionID]
+	if publication == nil {
+		publication = &commandPublication{}
+		b.commandPublications[sessionID] = publication
+	}
+	publication.pending = &commandSnapshot{
+		methodCtx: methodCtx,
+		commands:  cloneAvailableCommands(commands),
+	}
+	startPublisher := !b.commandPublisherRunning
+	if startPublisher {
+		b.commandPublisherRunning = true
+	}
+	b.mu.Unlock()
+	b.commandDiscoveryMu.Unlock()
+
+	if startPublisher {
+		go b.publishCommandSnapshots()
+	}
+}
+
+// publishCommandSnapshots is deliberately one bounded worker per bridge. A
+// generic io.Writer cannot be forcibly interrupted if it ignores peer close,
+// so allowing one worker per session would turn one broken transport into an
+// unbounded goroutine leak. Normal ACP embeddings close the paired output when
+// the peer closes; until then a blocked optional command update can occupy at
+// most this single bridge-owned publisher and later snapshots coalesce.
+func (b *Bridge) publishCommandSnapshots() {
+	for {
+		b.commandDiscoveryMu.Lock()
+		b.mu.Lock()
+		var (
+			sessionID string
+			snapshot  *commandSnapshot
+		)
+		for id, publication := range b.commandPublications {
+			if publication.pending == nil {
+				continue
+			}
+			sessionID = id
+			snapshot = publication.pending
+			delete(b.commandPublications, id)
+			break
+		}
+		if snapshot == nil {
+			b.commandPublisherRunning = false
+		}
+		b.mu.Unlock()
+		b.commandDiscoveryMu.Unlock()
+		if snapshot == nil {
+			return
+		}
+
+		// The provider result is a replacement snapshot. In particular, an empty
+		// result clears a previously published fallback catalog rather than
+		// leaving stale commands visible to the host. This runs outside all bridge
+		// locks: a slow or broken peer must not obstruct session cancellation.
+		if snapshot.methodCtx.ConnectionContext().Err() == nil {
+			_ = notifyAvailableCommandSnapshot(snapshot.methodCtx, sessionID, snapshot.commands, true)
+		}
+	}
+}
+
+func (b *Bridge) finishCommandDiscovery(sessionID string, generation uint64) {
+	b.commandDiscoveryMu.Lock()
+	b.mu.Lock()
+	if current, ok := b.commandDiscoveries[sessionID]; ok && current.generation == generation {
+		delete(b.commandDiscoveries, sessionID)
+	}
+	b.mu.Unlock()
+	b.commandDiscoveryMu.Unlock()
+}
+
+func (b *Bridge) commandDiscoveryTimeout() time.Duration {
+	if b.spec.CommandDiscoveryTimeout > 0 {
+		return b.spec.CommandDiscoveryTimeout
+	}
+	return defaultCommandDiscoveryTimeout
 }
 
 func (b *Bridge) beginPrompt(sessionID string, cancel context.CancelFunc) (*activePrompt, *acp.RPCError) {
@@ -1587,6 +1846,30 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return out
 }
 
+func cloneSession(value Session) Session {
+	value.Config = cloneStringMap(value.Config)
+	value.AdditionalDirectories = cloneStrings(value.AdditionalDirectories)
+	value.MCPServers = cloneMCPServers(value.MCPServers)
+	return value
+}
+
+func newCommandDiscoverySession(value Session) CommandDiscoverySession {
+	return CommandDiscoverySession{
+		ID:                    value.ID,
+		CWD:                   value.CWD,
+		AdditionalDirectories: cloneStrings(value.AdditionalDirectories),
+		Config:                cloneStringMap(value.Config),
+		ModeID:                value.ModeID,
+	}
+}
+
+func cloneAvailableCommands(values []AvailableCommand) []AvailableCommand {
+	if values == nil {
+		return nil
+	}
+	return append([]AvailableCommand(nil), values...)
+}
+
 func cloneStrings(values []string) []string {
 	if values == nil {
 		return nil
@@ -1607,11 +1890,36 @@ func cloneMCPServers(values []runtimeacp.MCPServer) []runtimeacp.MCPServer {
 		if value.Meta != nil {
 			out[i].Meta = make(map[string]any, len(value.Meta))
 			for key, metaValue := range value.Meta {
-				out[i].Meta[key] = metaValue
+				out[i].Meta[key] = cloneMCPMetaValue(metaValue)
 			}
 		}
 	}
 	return out
+}
+
+func cloneMCPMetaValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = cloneMCPMetaValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneMCPMetaValue(item)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	case []byte:
+		return append([]byte(nil), typed...)
+	case json.RawMessage:
+		return append(json.RawMessage(nil), typed...)
+	default:
+		return value
+	}
 }
 
 func cloneTranscript(values []transcriptExchange) []transcriptExchange {
