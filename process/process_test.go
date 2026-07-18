@@ -344,6 +344,53 @@ func TestStartUsesFixedArgvEnvAndPipes(t *testing.T) {
 	}
 }
 
+func TestStartWithBaseEnvDoesNotConsultHostEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "host-secret")
+	command, args := helperCommand("stream", "base-env")
+	child, err := adapterprocess.StartWithBaseEnv(context.Background(), adapterprocess.StartSpec{
+		Command: command,
+		Args:    args,
+		Dir:     t.TempDir(),
+		Env: adapterprocess.EnvPolicy{
+			Inherit: []string{"VISIBLE", "OPENAI_API_KEY"},
+			Set:     map[string]string{"GO_WANT_PROCESS_HELPER": "1"},
+		},
+		StderrLimit: 1024,
+	}, []string{"VISIBLE=from-host-boundary"})
+	if err != nil {
+		t.Fatalf("StartWithBaseEnv returned error: %v", err)
+	}
+	if err := child.Stdin.Close(); err != nil {
+		t.Fatalf("close stdin: %v", err)
+	}
+	stdout, err := io.ReadAll(child.Stdout)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatalf("Wait returned error: %v; stderr=%s", err, child.Stderr())
+	}
+	out := string(stdout)
+	if !strings.Contains(out, "VISIBLE=from-host-boundary") {
+		t.Fatalf("stdout = %q, want supplied base environment", out)
+	}
+	if strings.Contains(out, "OPENAI_API_KEY=") {
+		t.Fatalf("stdout = %q, leaked process environment outside supplied base", out)
+	}
+}
+
+func TestStartWithBaseEnvRejectsRelativeCommandDespiteHostPATH(t *testing.T) {
+	hostBin := t.TempDir()
+	t.Setenv("PATH", hostBin)
+	child, err := adapterprocess.StartWithBaseEnv(context.Background(), adapterprocess.StartSpec{
+		Command: "provider-agent",
+		Dir:     t.TempDir(),
+	}, []string{"PATH=" + t.TempDir()})
+	if child != nil || err == nil || !strings.Contains(err.Error(), "must be absolute with a host-owned base environment") {
+		t.Fatalf("StartWithBaseEnv = (%v, %v), want relative command rejection before host PATH lookup", child, err)
+	}
+}
+
 func TestStartCapturesStderrLimitAndExitError(t *testing.T) {
 	command, args := helperCommand("start-exit")
 	child, err := adapterprocess.Start(context.Background(), adapterprocess.StartSpec{

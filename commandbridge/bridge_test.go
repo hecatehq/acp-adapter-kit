@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1153,6 +1156,44 @@ func TestBridgeForkSessionClonesConfigAndSeparatesState(t *testing.T) {
 	}
 }
 
+func TestBridgePromptSessionCloneDoesNotShareNestedMCPMetadata(t *testing.T) {
+	prompts := 0
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		BuildPrompt: func(session commandbridge.Session, _ runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			prompts++
+			nested, ok := session.MCPServers[0].Meta["nested"].(map[string]any)
+			if !ok {
+				t.Fatalf("MCP metadata = %#v, want nested object", session.MCPServers[0].Meta)
+			}
+			if prompts == 1 {
+				nested["value"] = "mutated"
+			} else if got, want := nested["value"], "original"; got != want {
+				t.Fatalf("nested MCP metadata = %#v, want independent clone", nested)
+			}
+			return adapterprocess.Spec{Command: "agent", Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{}, nil
+		}),
+	})
+	client := acptest.NewClient(t, server(bridge))
+	client.Request("session/new", map[string]any{
+		"cwd": "/tmp/work",
+		"mcpServers": []map[string]any{{
+			"name": "private-mcp",
+			"_meta": map[string]any{
+				"nested": map[string]any{"value": "original"},
+			},
+		}},
+	})
+	client.Send(promptRequest(2, "session-1", "first"))
+	client.Send(promptRequest(3, "session-1", "second"))
+	if prompts != 2 {
+		t.Fatalf("prompt builds = %d, want 2", prompts)
+	}
+}
+
 func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		NewID: func() string { return "session-1" },
@@ -1195,6 +1236,372 @@ func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
 	loadCommands := decodeAvailableCommands(t, loadResponses[0])
 	if loadCommands.SessionID != "session-1" || len(loadCommands.Update.AvailableCommands) != 2 {
 		t.Fatalf("load commands = %#v, want command replay", loadCommands)
+	}
+}
+
+func TestBridgePublishesDiscoveredCommandsAsReplacementSnapshot(t *testing.T) {
+	discoveryStarted := make(chan commandbridge.CommandDiscoverySession, 1)
+	releaseDiscovery := make(chan struct{})
+	updates := make(chan availableCommandsUpdate, 4)
+	starter := commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+		t.Fatal("discovery callback unexpectedly started a process")
+		return nil, nil
+	})
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:          func() string { return "session-1" },
+		CommandStarter: starter,
+		Options: []commandbridge.SelectConfigOption{{
+			ID:           "model",
+			Name:         "Model",
+			DefaultValue: "default",
+			Options:      []commandbridge.SelectValue{{Value: "default", Name: "Default"}},
+		}},
+		Commands: []commandbridge.AvailableCommand{{Name: "fallback", Description: "Fallback command"}},
+		DiscoverCommands: func(ctx context.Context, session commandbridge.CommandDiscoverySession, got commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			if got == nil {
+				t.Error("command starter = nil, want supplied starter")
+			}
+			// Discovery must receive a private state snapshot. Mutating it must not
+			// alter the ACP session while this asynchronous callback is still live.
+			session.Config["model"] = "mutated"
+			session.AdditionalDirectories[0] = "/mutated"
+			discoveryStarted <- session
+			select {
+			case <-releaseDiscovery:
+				return []commandbridge.AvailableCommand{
+					{Name: "goal", Description: "Set a goal", InputHint: "goal"},
+					{Name: "loop", Description: "Configure a loop"},
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		BuildPrompt: func(session commandbridge.Session, _ runtimeacp.PromptParams) (adapterprocess.Spec, error) {
+			if got, want := session.Config["model"], "default"; got != want {
+				t.Errorf("prompt session model = %q, want %q", got, want)
+			}
+			if got, want := session.AdditionalDirectories, []string{"/tmp/extra"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("prompt additional directories = %#v, want %#v", got, want)
+			}
+			return adapterprocess.Spec{Command: "agent", Dir: session.CWD}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{}, nil
+		}),
+	})
+	client := acptest.NewLiveClient(t, server(bridge), acptest.WithLiveResponseHandler(func(_ *acptest.LiveClient, response acptest.Response) {
+		if response.Method == "session/update" {
+			var update struct {
+				Update struct {
+					SessionUpdate string `json:"sessionUpdate"`
+				} `json:"update"`
+			}
+			response.ParamsInto(t, &update)
+			if update.Update.SessionUpdate == "available_commands_update" {
+				updates <- decodeAvailableCommands(t, response)
+			}
+		}
+	}))
+
+	responses := client.Request("new", "session/new", map[string]any{
+		"cwd":                   "/tmp/work",
+		"additionalDirectories": []string{"/tmp/extra"},
+	}, time.Second)
+	if len(responses) != 2 {
+		t.Fatalf("session/new responses = %#v, want fallback update + response", responses)
+	}
+	initial := waitForAvailableCommands(t, client, updates)
+	if len(initial.Update.AvailableCommands) != 1 || initial.Update.AvailableCommands[0].Name != "fallback" {
+		t.Fatalf("initial commands = %#v, want fallback snapshot", initial)
+	}
+
+	select {
+	case session := <-discoveryStarted:
+		if got, want := session.Config["model"], "mutated"; got != want {
+			t.Fatalf("discovery session mutation = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command discovery")
+	}
+	close(releaseDiscovery)
+
+	discovered := waitForAvailableCommands(t, client, updates)
+	if discovered.SessionID != "session-1" || len(discovered.Update.AvailableCommands) != 2 ||
+		discovered.Update.AvailableCommands[0].Name != "goal" ||
+		discovered.Update.AvailableCommands[0].Input.Unstructured.Hint != "goal" ||
+		discovered.Update.AvailableCommands[1].Name != "loop" {
+		t.Fatalf("discovered commands = %#v, want authoritative goal + loop snapshot", discovered)
+	}
+
+	// The callback mutated only its snapshot; prompt construction still sees
+	// the session state owned by the bridge.
+	client.PromptText("prompt", "session-1", "hello", time.Second)
+}
+
+func TestBridgeCancelsDiscoveryWhenSessionCloses(t *testing.T) {
+	discoveryStarted := make(chan struct{}, 1)
+	discoveryCancelled := make(chan struct{}, 1)
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+			return nil, errors.New("discovery callback unexpectedly started a process")
+		}),
+		DiscoverCommands: func(ctx context.Context, _ commandbridge.CommandDiscoverySession, _ commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			discoveryStarted <- struct{}{}
+			<-ctx.Done()
+			discoveryCancelled <- struct{}{}
+			return nil, ctx.Err()
+		},
+	})
+	client := acptest.NewLiveClient(t, server(bridge))
+	client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+	select {
+	case <-discoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command discovery")
+	}
+	client.Request("close", "session/close", map[string]any{"sessionId": "session-1"}, time.Second)
+	select {
+	case <-discoveryCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command discovery cancellation")
+	}
+	client.AssertNoLateResponse("unexpected", 50*time.Millisecond)
+}
+
+func TestBridgeDiscoveryCancelsWhenACPTransportCloses(t *testing.T) {
+	discoveryStarted := make(chan struct{}, 1)
+	discoveryCancelled := make(chan struct{}, 1)
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+			return nil, errors.New("discovery callback unexpectedly started a process")
+		}),
+		DiscoverCommands: func(ctx context.Context, _ commandbridge.CommandDiscoverySession, _ commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			discoveryStarted <- struct{}{}
+			<-ctx.Done()
+			discoveryCancelled <- struct{}{}
+			return nil, ctx.Err()
+		},
+	})
+	inputReader, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server(bridge).Serve(inputReader, &output)
+	}()
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/tmp/work"}}`); err != nil {
+		t.Fatalf("write session/new: %v", err)
+	}
+	select {
+	case <-discoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command discovery")
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case <-discoveryCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("command discovery outlived closed ACP transport")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ACP server shutdown")
+	}
+}
+
+func TestBridgeCloseIsNotBlockedByCommandPublicationBackpressure(t *testing.T) {
+	firstDiscoveryStarted := make(chan struct{}, 1)
+	releaseFirstDiscovery := make(chan struct{})
+	secondDiscoveryStarted := make(chan struct{}, 1)
+	secondDiscoveryCancelled := make(chan struct{}, 1)
+	var discoveryCalls atomic.Int32
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+			return nil, errors.New("discovery callback unexpectedly started a process")
+		}),
+		DiscoverCommands: func(ctx context.Context, _ commandbridge.CommandDiscoverySession, _ commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			switch discoveryCalls.Add(1) {
+			case 1:
+				firstDiscoveryStarted <- struct{}{}
+				select {
+				case <-releaseFirstDiscovery:
+					return []commandbridge.AvailableCommand{{Name: "first"}}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			case 2:
+				secondDiscoveryStarted <- struct{}{}
+				<-ctx.Done()
+				secondDiscoveryCancelled <- struct{}{}
+				return nil, ctx.Err()
+			default:
+				return nil, errors.New("unexpected extra command discovery")
+			}
+		},
+	})
+	inputReader, inputWriter := io.Pipe()
+	writer := newGateWriter(2)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server(bridge).Serve(inputReader, writer)
+	}()
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/tmp/work"}}`); err != nil {
+		t.Fatalf("write session/new: %v", err)
+	}
+	select {
+	case <-firstDiscoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first command discovery")
+	}
+	select {
+	case write := <-writer.writes:
+		if write != 1 {
+			t.Fatalf("first output write = %d, want session/new response", write)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for session/new response write")
+	}
+	close(releaseFirstDiscovery)
+	select {
+	case <-writer.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked command publication")
+	}
+
+	// set_mode has no synchronous session update, so it schedules the second
+	// discovery even while the first available-commands notification is blocked
+	// in the ACP writer.
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"mode","method":"session/set_mode","params":{"sessionId":"session-1","modeId":"plan"}}`); err != nil {
+		t.Fatalf("write session/set_mode: %v", err)
+	}
+	select {
+	case <-secondDiscoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for superseding discovery")
+	}
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"close","method":"session/close","params":{"sessionId":"session-1"}}`); err != nil {
+		t.Fatalf("write session/close: %v", err)
+	}
+	select {
+	case <-secondDiscoveryCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("session/close was blocked behind command publication")
+	}
+
+	close(writer.release)
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ACP server shutdown")
+	}
+}
+
+func TestBridgeTransportShutdownDoesNotWaitForBlockedCommandPublication(t *testing.T) {
+	discoveryStarted := make(chan struct{}, 1)
+	releaseDiscovery := make(chan struct{})
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+			return nil, errors.New("discovery callback unexpectedly started a process")
+		}),
+		DiscoverCommands: func(ctx context.Context, _ commandbridge.CommandDiscoverySession, _ commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			discoveryStarted <- struct{}{}
+			select {
+			case <-releaseDiscovery:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return []commandbridge.AvailableCommand{{Name: "goal"}}, nil
+		},
+	})
+	inputReader, inputWriter := io.Pipe()
+	writer := newGateWriter(2) // session/new response, then async command update
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server(bridge).Serve(inputReader, writer)
+	}()
+	if _, err := fmt.Fprintln(inputWriter, `{"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/tmp/work"}}`); err != nil {
+		t.Fatalf("write session/new: %v", err)
+	}
+	select {
+	case <-discoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command discovery")
+	}
+	select {
+	case write := <-writer.writes:
+		if write != 1 {
+			t.Fatalf("first output write = %d, want session/new response", write)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for session/new response write")
+	}
+	close(releaseDiscovery)
+	select {
+	case <-writer.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked command publication")
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ACP shutdown waited for a blocked optional command publication")
+	}
+	// A real ACP embedding closes its paired output with the peer. Releasing
+	// this test writer models that transport cleanup and lets the single bounded
+	// publisher leave without retaining a session-specific worker.
+	close(writer.release)
+}
+
+func TestBridgeDiscoveryClearsFallbackWhenProviderReportsNoCommands(t *testing.T) {
+	updates := make(chan availableCommandsUpdate, 4)
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID:          func() string { return "session-1" },
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) { return nil, nil }),
+		Commands:       []commandbridge.AvailableCommand{{Name: "fallback"}},
+		DiscoverCommands: func(context.Context, commandbridge.CommandDiscoverySession, commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			return nil, nil
+		},
+	})
+	client := acptest.NewLiveClient(t, server(bridge), acptest.WithLiveResponseHandler(func(_ *acptest.LiveClient, response acptest.Response) {
+		if response.Method != "session/update" {
+			return
+		}
+		var update struct {
+			Update struct {
+				SessionUpdate string `json:"sessionUpdate"`
+			} `json:"update"`
+		}
+		response.ParamsInto(t, &update)
+		if update.Update.SessionUpdate == "available_commands_update" {
+			updates <- decodeAvailableCommands(t, response)
+		}
+	}))
+	client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+	_ = waitForAvailableCommands(t, client, updates) // bootstrap fallback
+	cleared := waitForAvailableCommands(t, client, updates)
+	if cleared.Update.AvailableCommands == nil || len(cleared.Update.AvailableCommands) != 0 {
+		t.Fatalf("cleared commands = %#v, want an explicit empty replacement snapshot", cleared)
 	}
 }
 
@@ -2181,6 +2588,75 @@ func TestBridgeAdvertisesAndRunsAuthenticateCommand(t *testing.T) {
 	}
 }
 
+func TestBridgeRefreshesCommandDiscoveryAfterAuthenticationStateChanges(t *testing.T) {
+	discoveryStarted := make(chan int32, 3)
+	initialDiscoveryCancelled := make(chan struct{}, 1)
+	var discoveries atomic.Int32
+	bridge := commandbridge.New(commandbridge.Spec{
+		NewID: func() string { return "session-1" },
+		AuthMethods: []acp.AuthMethod{{
+			ID: "agent-login",
+		}},
+		BuildAuthenticate: func(string) (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent", Args: []string{"login"}}, nil
+		},
+		BuildLogout: func() (adapterprocess.Spec, error) {
+			return adapterprocess.Spec{Command: "agent", Args: []string{"logout"}}, nil
+		},
+		Runner: commandbridge.RunnerFunc(func(context.Context, adapterprocess.Spec) (adapterprocess.Result, error) {
+			return adapterprocess.Result{}, nil
+		}),
+		CommandStarter: commandStarterFunc(func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+			return nil, errors.New("discovery callback unexpectedly started a process")
+		}),
+		DiscoverCommands: func(ctx context.Context, _ commandbridge.CommandDiscoverySession, _ commandbridge.CommandStarter) ([]commandbridge.AvailableCommand, error) {
+			call := discoveries.Add(1)
+			discoveryStarted <- call
+			if call == 1 {
+				<-ctx.Done()
+				initialDiscoveryCancelled <- struct{}{}
+				return nil, ctx.Err()
+			}
+			return []commandbridge.AvailableCommand{{Name: fmt.Sprintf("command-%d", call)}}, nil
+		},
+	})
+	client := acptest.NewLiveClient(t, server(bridge))
+	client.Request("new", "session/new", map[string]any{"cwd": "/tmp/work"}, time.Second)
+	select {
+	case call := <-discoveryStarted:
+		if call != 1 {
+			t.Fatalf("first discovery call = %d, want 1", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial command discovery")
+	}
+
+	client.Request("login", "authenticate", map[string]any{"methodId": "agent-login"}, time.Second)
+	select {
+	case <-initialDiscoveryCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("authentication did not supersede the initial command discovery")
+	}
+	select {
+	case call := <-discoveryStarted:
+		if call != 2 {
+			t.Fatalf("authentication discovery call = %d, want 2", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authentication did not refresh command discovery")
+	}
+
+	client.Request("logout", "logout", map[string]any{}, time.Second)
+	select {
+	case call := <-discoveryStarted:
+		if call != 3 {
+			t.Fatalf("logout discovery call = %d, want 3", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("logout did not refresh command discovery")
+	}
+}
+
 func TestBridgeAuthenticateRejectsUnknownMethod(t *testing.T) {
 	bridge := commandbridge.New(commandbridge.Spec{
 		AuthMethods: []acp.AuthMethod{{ID: "agent-login"}},
@@ -2410,6 +2886,46 @@ type availableCommandsUpdate struct {
 	} `json:"update"`
 }
 
+type commandStarterFunc func(context.Context, adapterprocess.StartSpec) (*adapterprocess.Child, error)
+
+func (f commandStarterFunc) Start(ctx context.Context, spec adapterprocess.StartSpec) (*adapterprocess.Child, error) {
+	return f(ctx, spec)
+}
+
+type gateWriter struct {
+	mu      sync.Mutex
+	buffer  bytes.Buffer
+	writes  chan int
+	blocked chan struct{}
+	release chan struct{}
+	blockAt int
+	count   int
+}
+
+func newGateWriter(blockAt int) *gateWriter {
+	return &gateWriter{
+		writes:  make(chan int, 16),
+		blocked: make(chan struct{}),
+		release: make(chan struct{}),
+		blockAt: blockAt,
+	}
+}
+
+func (w *gateWriter) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	w.count++
+	count := w.count
+	w.mu.Unlock()
+	w.writes <- count
+	if count == w.blockAt {
+		close(w.blocked)
+		<-w.release
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.Write(value)
+}
+
 type configOptionsUpdate struct {
 	SessionID string `json:"sessionId"`
 	Update    struct {
@@ -2467,4 +2983,24 @@ func decodeAvailableCommands(t testing.TB, response acptest.Response) availableC
 		t.Fatalf("session update = %q, want available_commands_update", update.Update.SessionUpdate)
 	}
 	return update
+}
+
+func waitForAvailableCommands(t testing.TB, client *acptest.LiveClient, updates <-chan availableCommandsUpdate) availableCommandsUpdate {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		select {
+		case update := <-updates:
+			return update
+		default:
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			t.Fatal("timed out waiting for available command update")
+		} else {
+			if remaining > 10*time.Millisecond {
+				remaining = 10 * time.Millisecond
+			}
+			client.AssertNoLateResponse("available-command-wait", remaining)
+		}
+	}
 }

@@ -8,6 +8,8 @@ This module intentionally contains provider-neutral pieces only:
 - provider-neutral Cobra command scaffolding for ACP adapters;
 - command-backed ACP session scaffolding for adapters that invoke a local CLI
   per prompt;
+- provider-neutral, asynchronous provider-command discovery for adapters that
+  can query a live command catalog;
 - runtime JSON-RPC client and cancellation plumbing;
 - ACP runtime request/result helpers for sessions, config, MCP, auth, and
   terminal callbacks;
@@ -78,6 +80,42 @@ Adapters have two runtime integration paths:
   transcripts retain only attachment metadata; ephemeral paths are removed
   from both user and assistant history and never replayed after the originating
   command.
+
+### Provider command discovery
+
+`commandbridge.Spec.Commands` is an optional immediate bootstrap snapshot for
+hosts that benefit from command completion before a provider has answered. An
+adapter with an authoritative provider command inventory can also set
+`DiscoverCommands`. The bridge then launches that provider-owned discovery
+exchange asynchronously through a `CommandStarter`, with a bounded context and
+the same fixed-argv binary and environment boundary used for prompts. A
+host-owned base environment requires the provider command to have already been
+bound to an absolute path; discovery never consults a broader parent `PATH`.
+Its result is an ACP `available_commands_update` replacement snapshot: it is
+not merged with, filtered by, or constrained to the bootstrap list. This lets
+an adapter publish provider-installed commands, aliases, and skills without
+duplicating the provider's catalog in Go.
+
+Discovery is re-run after session creation, load, resume, fork, configuration
+or mode changes, successful auth-state changes, and successful prompts. A
+later lifecycle change cancels and supersedes an older discovery; close, delete,
+and ACP transport shutdown cancel it as well. An empty authoritative result is
+sent explicitly so a host can clear stale bootstrap commands. Discovery errors
+are non-fatal and must not be surfaced as prompt or session failures. Provider
+callbacks receive a minimized `CommandDiscoverySession` containing only the
+session id, working directory, additional directories, selected config, and
+mode—not MCP server environment values, headers, or metadata. Adapters should
+parse only the command metadata they need and avoid logging or persisting
+unrelated runtime output.
+
+Command snapshots are optional transport notifications. The bridge serializes
+them through one bounded publisher worker per ACP bridge, so a pathological
+blocking output writer cannot create one blocked goroutine per session. Go
+cannot forcibly interrupt an arbitrary `io.Writer`; an embedding that owns
+paired ACP pipes must close the output side when its peer closes so an in-flight
+write returns. Until that happens, newer snapshots coalesce and session close,
+delete, discovery cancellation, and server shutdown continue without waiting
+for the optional publication.
 
 ### Command-backed rich prompt inputs
 
@@ -162,8 +200,8 @@ rich-resource text are excluded.
 
 `runtimeacp.EmbeddedResource.Kind` preserves whether an empty required ACP
 union value was `text` or `blob`; non-empty legacy struct literals continue to
-infer the variant. Because this adds an exported field to a public struct, the
-next compatible release containing rich prompt inputs is `v0.2.0`.
+infer the variant. Rich prompt inputs shipped in `v0.2.0`; the next compatible
+release adds the provider-neutral command-discovery lifecycle as `v0.3.0`.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.

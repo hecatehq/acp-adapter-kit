@@ -85,6 +85,47 @@ func TestInitializeOmitsUnsupportedSessionCapabilities(t *testing.T) {
 	}
 }
 
+func TestMethodContextConnectionContextCancelsWhenTransportCloses(t *testing.T) {
+	connectionContexts := make(chan context.Context, 1)
+	server := NewServer(AdapterInfo{Name: "test"}, WithMethod("test/hold", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+		connectionCtx := ctx.ConnectionContext()
+		connectionContexts <- connectionCtx
+		<-connectionCtx.Done()
+		return map[string]any{}, nil
+	}))
+	inputReader, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(inputReader, &output)
+	}()
+	if _, err := io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":"hold","method":"test/hold","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	var connectionCtx context.Context
+	select {
+	case connectionCtx = <-connectionContexts:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for method context")
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case <-connectionCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("connection context was not cancelled after input EOF")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
 func TestInitializeCanUseRuntimeResult(t *testing.T) {
 	server := NewServer(AdapterInfo{Name: "codex-acp-adapter"}, WithInitializeResult(map[string]any{
 		"protocolVersion": 1,

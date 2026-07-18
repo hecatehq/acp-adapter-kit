@@ -98,12 +98,14 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 // supplied host environment. A nil base preserves Run's process-environment
 // behavior; a non-nil empty slice starts from no inherited values. Embedding
 // hosts use this seam to keep their own credential and HOME boundary intact.
+// With a non-nil base, Command must already be an absolute bound provider
+// binary; the parent PATH is never consulted to choose an executable.
 func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	resolved, err := ResolveCommand(spec.Command)
+	resolved, err := resolveCommand(spec.Command, baseEnv)
 	if err != nil {
 		return Result{}, err
 	}
@@ -166,7 +168,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 		ctx = context.Background()
 	}
 
-	resolved, err := ResolveCommand(spec.Command)
+	resolved, err := resolveCommand(spec.Command, baseEnv)
 	if err != nil {
 		return Result{}, err
 	}
@@ -246,11 +248,21 @@ func resolveBaseEnv(baseEnv []string) []string {
 }
 
 func Start(ctx context.Context, spec StartSpec) (*Child, error) {
+	return StartWithBaseEnv(ctx, spec, nil)
+}
+
+// StartWithBaseEnv starts a fixed-argv process with stdin/stdout pipes after
+// applying spec.Env to the supplied host environment. A nil base preserves
+// Start's process-environment behavior; a non-nil empty slice starts from no
+// inherited values. Embedding hosts use this seam to keep discovery processes
+// inside the same credential and HOME boundary as prompt processes. With a
+// non-nil base, Command must already be an absolute bound provider binary.
+func StartWithBaseEnv(ctx context.Context, spec StartSpec, baseEnv []string) (*Child, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	resolved, err := ResolveCommand(spec.Command)
+	resolved, err := resolveCommand(spec.Command, baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +273,7 @@ func Start(ctx context.Context, spec StartSpec) (*Child, error) {
 	if err != nil {
 		return nil, err
 	}
-	env, err := BuildEnv(os.Environ(), spec.Env)
+	env, err := BuildEnv(resolveBaseEnv(baseEnv), spec.Env)
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +429,10 @@ func (c *Child) StderrTruncated() bool {
 }
 
 func ResolveCommand(command string) (string, error) {
+	return resolveCommand(command, nil)
+}
+
+func resolveCommand(command string, baseEnv []string) (string, error) {
 	if command == "" {
 		return "", errors.New("process command is required")
 	}
@@ -431,6 +447,13 @@ func ResolveCommand(command string) (string, error) {
 	}
 	if strings.ContainsRune(command, filepath.Separator) {
 		return "", fmt.Errorf("process command path must be absolute: %s", command)
+	}
+	if baseEnv != nil {
+		// exec.LookPath consults the parent process environment, not exec.Cmd.Env.
+		// A host that supplies a restricted base must bind the provider binary to
+		// an absolute path before entering this process seam, rather than letting
+		// a wider host PATH choose the executable.
+		return "", fmt.Errorf("process command must be absolute with a host-owned base environment: %s", command)
 	}
 	resolved, err := exec.LookPath(command)
 	if err != nil {
