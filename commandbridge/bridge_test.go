@@ -1199,7 +1199,7 @@ func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
 		NewID: func() string { return "session-1" },
 		Commands: []commandbridge.AvailableCommand{
 			{Name: "web", Description: "Search the web", InputHint: "query"},
-			{Name: "plan", Description: "Create a plan"},
+			{Name: "plan"},
 		},
 		BuildPrompt: func(commandbridge.Session, runtimeacp.PromptParams) (adapterprocess.Spec, error) {
 			return adapterprocess.Spec{}, nil
@@ -1220,8 +1220,22 @@ func TestBridgePublishesAvailableCommandsOnSessionCreateAndLoad(t *testing.T) {
 	if createCommands.SessionID != "session-1" ||
 		len(createCommands.Update.AvailableCommands) != 2 ||
 		createCommands.Update.AvailableCommands[0].Name != "web" ||
-		createCommands.Update.AvailableCommands[0].Input.Unstructured.Hint != "query" {
+		createCommands.Update.AvailableCommands[0].Input.Hint != "query" {
 		t.Fatalf("create commands = %#v, want web + plan commands", createCommands)
+	}
+	var createWire struct {
+		Update struct {
+			AvailableCommands []map[string]json.RawMessage `json:"availableCommands"`
+		} `json:"update"`
+	}
+	if err := json.Unmarshal(createResponses[0].Params, &createWire); err != nil {
+		t.Fatalf("decode command wire notification: %v", err)
+	}
+	if got := string(createWire.Update.AvailableCommands[0]["input"]); got != `{"hint":"query"}` {
+		t.Fatalf("command input wire = %s, want standard unstructured hint", got)
+	}
+	if got := string(createWire.Update.AvailableCommands[1]["description"]); got != `""` {
+		t.Fatalf("empty command description wire = %s, want required empty string", got)
 	}
 
 	loadResponses := client.Send(map[string]any{
@@ -1328,7 +1342,7 @@ func TestBridgePublishesDiscoveredCommandsAsReplacementSnapshot(t *testing.T) {
 	discovered := waitForAvailableCommands(t, client, updates)
 	if discovered.SessionID != "session-1" || len(discovered.Update.AvailableCommands) != 2 ||
 		discovered.Update.AvailableCommands[0].Name != "goal" ||
-		discovered.Update.AvailableCommands[0].Input.Unstructured.Hint != "goal" ||
+		discovered.Update.AvailableCommands[0].Input.Hint != "goal" ||
 		discovered.Update.AvailableCommands[1].Name != "loop" {
 		t.Fatalf("discovered commands = %#v, want authoritative goal + loop snapshot", discovered)
 	}
@@ -2878,9 +2892,7 @@ type availableCommandsUpdate struct {
 			Name        string `json:"name"`
 			Description string `json:"description"`
 			Input       struct {
-				Unstructured struct {
-					Hint string `json:"hint"`
-				} `json:"unstructured"`
+				Hint string `json:"hint"`
 			} `json:"input"`
 		} `json:"availableCommands"`
 	} `json:"update"`

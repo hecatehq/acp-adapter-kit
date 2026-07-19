@@ -1415,15 +1415,11 @@ func notifyAvailableCommandSnapshot(ctx *acp.MethodContext, sessionID string, av
 			continue
 		}
 		item := map[string]any{
-			"name": name,
-		}
-		if description := strings.TrimSpace(command.Description); description != "" {
-			item["description"] = description
+			"name":        name,
+			"description": strings.TrimSpace(command.Description),
 		}
 		if hint := strings.TrimSpace(command.InputHint); hint != "" {
-			item["input"] = map[string]any{
-				"unstructured": map[string]any{"hint": hint},
-			}
+			item["input"] = map[string]any{"hint": hint}
 		}
 		commands = append(commands, item)
 	}
