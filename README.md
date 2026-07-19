@@ -200,8 +200,11 @@ rich-resource text are excluded.
 
 `runtimeacp.EmbeddedResource.Kind` preserves whether an empty required ACP
 union value was `text` or `blob`; non-empty legacy struct literals continue to
-infer the variant. Rich prompt inputs shipped in `v0.2.0`; the next compatible
-release adds the provider-neutral command-discovery lifecycle as `v0.3.0`.
+infer the variant. Rich prompt inputs shipped in `v0.2.0`; `v0.3.0` added the
+provider-neutral command-discovery lifecycle. `v0.3.1` corrects
+`available_commands_update` input hints to the standard ACP unstructured input
+shape (`{"hint":"..."}`) and always emits the required command description
+field.
 
 Keep provider-specific command arguments, model lists, reasoning options, and
 auth guidance in the adapter repositories.
