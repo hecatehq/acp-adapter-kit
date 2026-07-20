@@ -126,6 +126,156 @@ func TestMethodContextConnectionContextCancelsWhenTransportCloses(t *testing.T) 
 	}
 }
 
+func TestServerCancelsActiveConcurrentMethodWhenTransportCloses(t *testing.T) {
+	methodStarted := make(chan struct{})
+	methodCancelled := make(chan error, 1)
+	server := NewServer(AdapterInfo{Name: "test"}, WithConcurrentMethod("test/hold", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+		close(methodStarted)
+		<-ctx.Context().Done()
+		methodCancelled <- ctx.Context().Err()
+		return map[string]any{"stopped": true}, nil
+	}))
+	inputReader, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(inputReader, &output)
+	}()
+	if _, err := io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":"hold","method":"test/hold","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-methodStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for concurrent method")
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case err := <-methodCancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("method context error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active method context was not cancelled after input EOF")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestServerCancelsQueuedMethodThatBeginsAfterTransportCloses(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondCancelled := make(chan error, 1)
+	server := NewServer(
+		AdapterInfo{Name: "test"},
+		WithMethod("test/first", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+			close(firstStarted)
+			<-ctx.Context().Done()
+			return map[string]any{"stopped": true}, nil
+		}),
+		WithMethod("test/second", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+			secondCancelled <- ctx.Context().Err()
+			return map[string]any{"stopped": true}, nil
+		}),
+	)
+	inputReader, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(inputReader, &output)
+	}()
+	if _, err := io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":"first","method":"test/first","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write first request: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first method")
+	}
+	if _, err := io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":"second","method":"test/second","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	select {
+	case err := <-secondCancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued method context error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued method did not start after transport shutdown")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestServerWaitsForHandlersAfterInputError(t *testing.T) {
+	inputErr := errors.New("input failed")
+	releaseInputError := make(chan struct{})
+	methodStarted := make(chan struct{})
+	methodCancelled := make(chan error, 1)
+	allowMethodReturn := make(chan struct{})
+	server := NewServer(AdapterInfo{Name: "test"}, WithMethod("test/hold", func(ctx *MethodContext, _ json.RawMessage) (any, *RPCError) {
+		close(methodStarted)
+		<-ctx.Context().Done()
+		methodCancelled <- ctx.Context().Err()
+		<-allowMethodReturn
+		return map[string]any{"stopped": true}, nil
+	}))
+	input := &errorAfterRequestReader{
+		request: `{"jsonrpc":"2.0","id":"hold","method":"test/hold","params":{}}` + "\n",
+		err:     inputErr,
+		release: releaseInputError,
+	}
+	var output bytes.Buffer
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(input, &output)
+	}()
+	select {
+	case <-methodStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ordered method")
+	}
+	close(releaseInputError)
+	select {
+	case err := <-methodCancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("method context error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active method context was not cancelled after input error")
+	}
+	select {
+	case err := <-serveDone:
+		t.Fatalf("Serve returned %v before the cancelled method finished", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(allowMethodReturn)
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, inputErr) {
+			t.Fatalf("Serve returned error = %v, want input error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
 func TestInitializeCanUseRuntimeResult(t *testing.T) {
 	server := NewServer(AdapterInfo{Name: "codex-acp-adapter"}, WithInitializeResult(map[string]any{
 		"protocolVersion": 1,
@@ -972,6 +1122,22 @@ func (w *cancelThenBlockWriter) Write(data []byte) (int, error) {
 		<-w.release
 	}
 	return len(data), nil
+}
+
+type errorAfterRequestReader struct {
+	request string
+	err     error
+	release <-chan struct{}
+}
+
+func (r *errorAfterRequestReader) Read(data []byte) (int, error) {
+	if r.request != "" {
+		n := copy(data, r.request)
+		r.request = r.request[n:]
+		return n, nil
+	}
+	<-r.release
+	return 0, r.err
 }
 
 type serverTestClient struct {

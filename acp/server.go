@@ -70,6 +70,8 @@ type MethodContext struct {
 	ctx  context.Context
 }
 
+// Context returns the request-scoped context. It is cancelled when the client
+// cancels the request, the handler returns, or the peer transport closes.
 func (c *MethodContext) Context() context.Context {
 	if c == nil || c.ctx == nil {
 		return context.Background()
@@ -262,17 +264,32 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 			finish()
 		}()
 	}
+	waitForHandlers := func() error {
+		<-methodsDone
+		concurrent.Wait()
+		select {
+		case err := <-handlerErr:
+			return err
+		default:
+			return nil
+		}
+	}
+	shutdown := func(err error) error {
+		methods.close()
+		conn.finishRequests(err)
+		return waitForHandlers()
+	}
 
 	for {
 		msg, ok, err := conn.readMessage()
 		if err != nil {
 			var parseErr parseMessageError
 			if !errors.As(err, &parseErr) {
-				conn.finishRequests(err)
+				_ = shutdown(err)
 				return err
 			}
 			if err := conn.write(errorResponse(nil, -32700, "parse error", parseErr.Err.Error())); err != nil {
-				conn.finishRequests(err)
+				_ = shutdown(err)
 				return err
 			}
 			continue
@@ -294,7 +311,7 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 		if msg.ID == nil {
 			if handler := s.notifications[msg.Method]; handler != nil {
 				if err := handler(msg.Params); err != nil {
-					conn.finishRequests(err)
+					_ = shutdown(err)
 					return err
 				}
 			}
@@ -313,29 +330,10 @@ func (s *Server) Serve(input io.Reader, output io.Writer) error {
 		}
 		methods.push(req)
 	}
-	methods.close()
-	conn.finishRequests(io.EOF)
-	select {
-	case err := <-handlerErr:
+	if err := shutdown(io.EOF); err != nil {
 		return err
-	case <-methodsDone:
 	}
-	concurrentDone := make(chan struct{})
-	go func() {
-		concurrent.Wait()
-		close(concurrentDone)
-	}()
-	select {
-	case err := <-handlerErr:
-		return err
-	case <-concurrentDone:
-	}
-	select {
-	case err := <-handlerErr:
-		return err
-	default:
-		return scanner.Err()
-	}
+	return scanner.Err()
 }
 
 func (s *Server) handle(ctx *MethodContext, req request) response {
@@ -722,13 +720,22 @@ func (c *connection) beginInboundRequest(id *json.RawMessage) (*MethodContext, f
 	key := string(*id)
 	c.requestMu.Lock()
 	delete(c.queued, key)
-	if _, ok := c.cancelled[key]; ok {
+	closed := c.closed
+	if closed {
+		delete(c.cancelled, key)
+	} else if _, ok := c.cancelled[key]; ok {
 		delete(c.cancelled, key)
 		cancel()
 	} else {
 		c.active[key] = cancel
 	}
 	c.requestMu.Unlock()
+	if closed {
+		// A queued request can race transport shutdown and begin only after
+		// finishRequests has already drained the active set. Do not let that
+		// handler outlive the peer.
+		cancel()
+	}
 	return &MethodContext{conn: c, ctx: ctx}, func() {
 		c.requestMu.Lock()
 		delete(c.active, key)
@@ -800,9 +807,16 @@ func (c *connection) finishRequests(err error) {
 	lifetimeCancel := c.lifetimeCancel
 	pending := c.pending
 	c.pending = map[string]chan clientResponse{}
+	active := c.active
+	c.active = map[string]context.CancelFunc{}
+	c.queued = map[string]struct{}{}
+	c.cancelled = map[string]struct{}{}
 	c.requestMu.Unlock()
 	if lifetimeCancel != nil {
 		lifetimeCancel()
+	}
+	for _, cancel := range active {
+		cancel()
 	}
 	for _, resultCh := range pending {
 		resultCh <- clientResponse{err: err}
