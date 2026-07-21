@@ -42,12 +42,13 @@ The lower-level `process.Spec` and `process.StartSpec` APIs run commands with
 direct fixed argv by default and continue to reject shells. Windows package
 managers may expose a provider as an absolute `.cmd` or `.bat` launcher; a host
 can opt that exact launcher into `CommandModeWindowsCommandShim`. This mode is
-rejected on non-Windows systems. On Windows it validates the launcher and every
-argument against command-interpreter metacharacters, then invokes only the
-trusted System32 `cmd.exe` with fixed switches and kit-owned environment
-indirection. It is intentionally not a general shell escape hatch: relative
-launchers, other script types, direct shell commands, and unsafe values fail
-closed.
+rejected on non-Windows systems. On Windows it validates the launcher, sends the
+NUL-free argument vector as encoded data to a fixed kit-owned bridge in the
+trusted system Windows PowerShell, removes that transport value before starting
+the launcher, and preserves stdin/stdout/stderr. Provider processes and their
+descendants therefore do not inherit prompt or config arguments through bridge
+environment variables. It is intentionally not a general shell escape hatch:
+relative launchers, other script types, and direct shell commands fail closed.
 
 Adapters have two runtime integration paths:
 

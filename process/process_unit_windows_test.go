@@ -4,6 +4,7 @@ package process_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,9 @@ import (
 
 func TestWindowsCommandShimRun(t *testing.T) {
 	shim := writeWindowsCommandShim(t, "run.cmd", `@echo off
+if defined ACP_ADAPTER_KIT_PROCESS_SHIM_INVOCATION exit /b 40
+if defined ACP_ADAPTER_KIT_PROCESS_SHIM_COMMAND exit /b 43
+if defined ACP_ADAPTER_KIT_PROCESS_SHIM_ARG_0000 exit /b 44
 if not "%~1"=="hello world" exit /b 41
 if not "%~2"=="--flag=value" exit /b 42
 echo RUN:%~1:%~2:%VISIBLE%
@@ -117,10 +121,16 @@ IF EXIST "%dp0%\node.exe" (
 endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "-test.run=TestWindowsNPMShimHelper" "--" %*
 `)
 	copyWindowsTestExecutable(t, filepath.Join(filepath.Dir(shim), "node.exe"))
+	args := []string{
+		`prompt with "quotes" & (parentheses)`,
+		`100% !important! ^ caret | pipe <in>`,
+		` leading and trailing `,
+		`{"mcp":{"headers":{"Authorization":"Bearer secret"}}}`,
+	}
 	child, err := adapterprocess.StartWithBaseEnv(context.Background(), adapterprocess.StartSpec{
 		Command:     shim,
 		CommandMode: adapterprocess.CommandModeWindowsCommandShim,
-		Args:        []string{"forwarded", "two words"},
+		Args:        args,
 		Dir:         t.TempDir(),
 		Env: adapterprocess.EnvPolicy{Set: map[string]string{
 			"GO_WANT_WINDOWS_NPM_SHIM_HELPER": "1",
@@ -144,8 +154,12 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "-test.run=Te
 		t.Fatalf("Wait error = %T %[1]v, want exit code 23; stderr=%s", err, child.Stderr())
 	}
 	normalized := strings.ReplaceAll(string(stdout), "\r\n", "\n")
-	if !strings.Contains(normalized, "NPM_ARGS=forwarded|two words\n") {
-		t.Fatalf("stdout = %q, want forwarded %%* arguments", normalized)
+	wantArgsJSON, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("marshal expected args: %v", err)
+	}
+	if !strings.Contains(normalized, "NPM_ARGS_JSON="+string(wantArgsJSON)+"\n") {
+		t.Fatalf("stdout = %q, want exact forwarded %%* arguments %s", normalized, wantArgsJSON)
 	}
 	if !strings.Contains(normalized, "NPM_STDIN=npm wrapper stdin\n") {
 		t.Fatalf("stdout = %q, want forwarded stdin", normalized)
@@ -167,7 +181,15 @@ func TestWindowsNPMShimHelper(t *testing.T) {
 		os.Exit(21)
 	}
 	stdin, _ := io.ReadAll(os.Stdin)
-	fmt.Printf("NPM_ARGS=%s\n", strings.Join(os.Args[separator+1:], "|"))
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "ACP_ADAPTER_KIT_PROCESS_SHIM_") {
+			fmt.Printf("NPM_SHIM_ENV_LEAK=%s\n", name)
+			os.Exit(24)
+		}
+	}
+	rawArgs, _ := json.Marshal(os.Args[separator+1:])
+	fmt.Printf("NPM_ARGS_JSON=%s\n", rawArgs)
 	fmt.Printf("NPM_STDIN=%s\n", stdin)
 	os.Exit(23)
 }
@@ -227,64 +249,39 @@ echo START:%~1:%INPUT%
 	}
 }
 
-func TestWindowsCommandShimRejectsUnsafeInputs(t *testing.T) {
-	shim := writeWindowsCommandShim(t, "safe.cmd", "@echo off\r\necho safe\r\n")
-	unsafeArgs := []struct {
-		value   string
-		message string
-	}{
-		{value: "quote\"", message: "Windows command shim arg 0"},
-		{value: "percent%PATH%", message: "Windows command shim arg 0"},
-		{value: "bang!", message: "Windows command shim arg 0"},
-		{value: "caret^", message: "Windows command shim arg 0"},
-		{value: "ampersand&whoami", message: "Windows command shim arg 0"},
-		{value: "pipe|whoami", message: "Windows command shim arg 0"},
-		{value: "redirect>file", message: "Windows command shim arg 0"},
-		{value: "redirect<input", message: "Windows command shim arg 0"},
-		{value: "open(", message: "Windows command shim arg 0"},
-		{value: "close)", message: "Windows command shim arg 0"},
-		{value: "line\rbreak", message: "Windows command shim arg 0"},
-		{value: "line\nbreak", message: "Windows command shim arg 0"},
-		{value: "tab\tbreak", message: "Windows command shim arg 0"},
-		{value: "nul\x00byte", message: "process arg 0 contains NUL byte"},
-		{value: " leading", message: "Windows command shim arg 0"},
-		{value: "trailing ", message: "Windows command shim arg 0"},
-	}
-	for _, unsafe := range unsafeArgs {
-		t.Run(strings.ReplaceAll(unsafe.value, "\x00", "NUL"), func(t *testing.T) {
-			_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
-				Command:     shim,
-				CommandMode: adapterprocess.CommandModeWindowsCommandShim,
-				Args:        []string{unsafe.value},
-				Dir:         t.TempDir(),
-			})
-			if err == nil || !strings.Contains(err.Error(), unsafe.message) {
-				t.Fatalf("Run error = %v, want unsafe-arg rejection", err)
-			}
-		})
-	}
-
-	unsafePath := filepath.Join(`C:\`, "unsafe&agent.cmd")
-	_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
-		Command:     unsafePath,
+func TestWindowsCommandShimRejectsOnlyUnrepresentableArgument(t *testing.T) {
+	shim := writeWindowsCommandShim(t, "safe & agent.cmd", "@echo off\r\necho safe\r\n")
+	result, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
+		Command:     shim,
 		CommandMode: adapterprocess.CommandModeWindowsCommandShim,
+		Args:        []string{`quotes " percent% bang! caret^ ampersand& pipe| redirect<> parentheses()`, " leading and trailing "},
 		Dir:         t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "Windows command shim path") {
-		t.Fatalf("Run error = %v, want unsafe-path rejection", err)
+	if err != nil {
+		t.Fatalf("Run error = %v; stderr=%s", err, result.Stderr)
+	}
+
+	_, err = adapterprocess.Run(context.Background(), adapterprocess.Spec{
+		Command:     shim,
+		CommandMode: adapterprocess.CommandModeWindowsCommandShim,
+		Args:        []string{"nul\x00byte"},
+		Dir:         t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "process arg 0 contains NUL byte") {
+		t.Fatalf("Run error = %v, want NUL rejection", err)
 	}
 }
 
-func TestWindowsCommandShimRejectsOversizedExpandedCommand(t *testing.T) {
+func TestWindowsCommandShimRejectsOversizedEncodedInvocation(t *testing.T) {
 	shim := writeWindowsCommandShim(t, "safe.cmd", "@echo off\r\necho safe\r\n")
 	_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
 		Command:     shim,
 		CommandMode: adapterprocess.CommandModeWindowsCommandShim,
-		Args:        []string{strings.Repeat("a", 8001)},
+		Args:        []string{strings.Repeat("a", 18_001)},
 		Dir:         t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "invocation exceeds 8000 characters") {
-		t.Fatalf("Run error = %v, want expanded-command limit", err)
+	if err == nil || !strings.Contains(err.Error(), "invocation exceeds 24000 encoded bytes") {
+		t.Fatalf("Run error = %v, want encoded-invocation limit", err)
 	}
 }
 

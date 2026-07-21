@@ -3,24 +3,50 @@
 package process
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
-	"syscall"
+	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
 )
 
 const (
-	windowsShimCommandEnv = "ACP_ADAPTER_KIT_PROCESS_SHIM_COMMAND"
-	// cmd.exe accepts at most 8191 expanded command-line characters. Keep a
-	// margin for fixed switches and fail before the payload reaches that bound.
-	windowsCommandMax = 8000
+	windowsShimInvocationEnv  = "ACP_ADAPTER_KIT_PROCESS_SHIM_INVOCATION"
+	windowsShimReservedPrefix = "ACP_ADAPTER_KIT_PROCESS_SHIM_"
+	// The inherited Windows environment block is limited to 32,767 UTF-16
+	// code units. Keep the bridge payload bounded so common host environments
+	// retain headroom for their ordinary variables.
+	windowsShimPayloadMax = 24_000
 )
+
+// windowsShimBridgeScript is fixed kit-owned PowerShell. Invocation data is a
+// base64 JSON value in one environment variable, never interpolated into this
+// script. The bridge removes that variable before starting the command shim so
+// the provider and its descendants cannot inherit prompt/config arguments.
+const windowsShimBridgeScript = `$ErrorActionPreference = 'Stop'
+$encoded = $env:ACP_ADAPTER_KIT_PROCESS_SHIM_INVOCATION
+Remove-Item Env:ACP_ADAPTER_KIT_PROCESS_SHIM_INVOCATION -ErrorAction SilentlyContinue
+if ([string]::IsNullOrEmpty($encoded)) { throw 'missing command-shim invocation' }
+$json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded))
+$invocation = $json | ConvertFrom-Json
+$command = [string]$invocation.command
+$arguments = @()
+foreach ($argument in $invocation.args) { $arguments += [string]$argument }
+& $command @arguments
+if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
+if (-not $?) { exit 1 }
+`
+
+type windowsShimInvocation struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
 
 func validateDirectCommand(command string) error {
 	ext := strings.ToLower(filepath.Ext(command))
@@ -30,18 +56,8 @@ func validateDirectCommand(command string) error {
 	return nil
 }
 
-func newProcessCommand(mode CommandMode, command string, args []string) *exec.Cmd {
-	if mode != CommandModeWindowsCommandShim {
-		return exec.Command(command, args...)
-	}
-	cmd := exec.Command(command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// cmd.exe does not use CommandLineToArgvW parsing. Bypass os/exec's
-		// generic Windows argv quoting and provide the exact command line,
-		// which contains only fixed switches and kit-owned variable names.
-		CmdLine: syscall.EscapeArg(command) + " " + strings.Join(args, " "),
-	}
-	return cmd
+func newProcessCommand(_ CommandMode, command string, args []string) *exec.Cmd {
+	return exec.Command(command, args...)
 }
 
 func resolveWindowsCommandShim(command string) (string, error) {
@@ -52,9 +68,6 @@ func resolveWindowsCommandShim(command string) (string, error) {
 		return "", fmt.Errorf("Windows command shim path must be absolute: %s", command)
 	}
 	clean := filepath.Clean(command)
-	if err := validateWindowsShimValue("path", clean, false); err != nil {
-		return "", err
-	}
 	ext := strings.ToLower(filepath.Ext(clean))
 	if ext != ".cmd" && ext != ".bat" {
 		return "", fmt.Errorf("Windows command shim must have a .cmd or .bat extension: %s", clean)
@@ -73,10 +86,16 @@ func resolveWindowsCommandShim(command string) (string, error) {
 }
 
 func prepareWindowsCommandShim(command string, args []string, env []string) (string, []string, []string, error) {
-	for i, arg := range args {
-		if err := validateWindowsShimValue(fmt.Sprintf("arg %d", i), arg, true); err != nil {
-			return "", nil, nil, err
-		}
+	raw, err := json.Marshal(windowsShimInvocation{
+		Command: command,
+		Args:    append([]string(nil), args...),
+	})
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("encode Windows command-shim invocation: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	if len(encoded) > windowsShimPayloadMax {
+		return "", nil, nil, fmt.Errorf("Windows command-shim invocation exceeds %d encoded bytes", windowsShimPayloadMax)
 	}
 
 	systemDir, err := windows.GetSystemDirectory()
@@ -86,77 +105,51 @@ func prepareWindowsCommandShim(command string, args []string, env []string) (str
 	if !filepath.IsAbs(systemDir) {
 		return "", nil, nil, fmt.Errorf("trusted Windows system directory is not absolute: %s", systemDir)
 	}
-	cmdPath := filepath.Join(systemDir, "cmd.exe")
-
-	shimEnv := make(map[string]string, len(args)+1)
-	shimEnv[windowsShimCommandEnv] = command
-	references := make([]string, 0, len(args)+1)
-	references = append(references, `"%`+windowsShimCommandEnv+`%"`)
-	expandedLength := len(command) + 4 // command quotes plus outer /s quotes
-	for i, arg := range args {
-		name := fmt.Sprintf("ACP_ADAPTER_KIT_PROCESS_SHIM_ARG_%04d", i)
-		shimEnv[name] = arg
-		references = append(references, `"%`+name+`%"`)
-		expandedLength += len(arg) + 3 // separating space plus argument quotes
+	powerShellPath := filepath.Join(systemDir, "WindowsPowerShell", "v1.0", "powershell.exe")
+	info, err := os.Stat(powerShellPath)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("inspect trusted Windows PowerShell bridge: %w", err)
 	}
-	payload := `"` + strings.Join(references, " ") + `"`
-	launchArgs := []string{"/d", "/e:on", "/v:off", "/s", "/c", payload}
-	fixedLength := len(syscall.EscapeArg(cmdPath)) + 1 + len(strings.Join(launchArgs[:5], " ")) + 1
-	if fixedLength+len(payload) > windowsCommandMax || fixedLength+expandedLength > windowsCommandMax {
-		return "", nil, nil, fmt.Errorf("Windows command shim invocation exceeds %d characters", windowsCommandMax)
+	if !info.Mode().IsRegular() {
+		return "", nil, nil, fmt.Errorf("trusted Windows PowerShell bridge is not a regular file: %s", powerShellPath)
 	}
 
-	// Standard package-manager shims depend on command extensions for SETLOCAL,
-	// CALL :label, and %~dp0. Enable them deterministically while disabling
-	// AutoRun and delayed expansion; no user-derived byte enters the raw line.
-	return cmdPath,
-		launchArgs,
-		withWindowsEnvOverrides(env, shimEnv),
-		nil
+	encodedScript := base64.StdEncoding.EncodeToString(utf16LEBytes(windowsShimBridgeScript))
+	launchArgs := []string{
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-EncodedCommand",
+		encodedScript,
+	}
+	return powerShellPath, launchArgs, withWindowsShimInvocation(env, encoded), nil
 }
 
-func validateWindowsShimValue(label string, value string, emptyAllowed bool) error {
-	if !emptyAllowed && value == "" {
-		return fmt.Errorf("Windows command shim %s is required", label)
+func utf16LEBytes(value string) []byte {
+	units := utf16.Encode([]rune(value))
+	out := make([]byte, len(units)*2)
+	for i, unit := range units {
+		out[i*2] = byte(unit)
+		out[i*2+1] = byte(unit >> 8)
 	}
-	if strings.TrimSpace(value) != value {
-		return fmt.Errorf("Windows command shim %s has leading or trailing whitespace", label)
-	}
-	if strings.ContainsAny(value, "\x00\r\n\"%!^&|<>()") {
-		return fmt.Errorf("Windows command shim %s contains unsafe command-interpreter characters", label)
-	}
-	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("Windows command shim %s contains unsafe control characters", label)
-		}
-	}
-	return nil
+	return out
 }
 
-func withWindowsEnvOverrides(env []string, overrides map[string]string) []string {
-	result := make([]string, 0, len(env)+len(overrides))
+func withWindowsShimInvocation(env []string, encoded string) []string {
+	result := make([]string, 0, len(env)+1)
 	for _, entry := range env {
 		name, _, ok := strings.Cut(entry, "=")
-		if !ok || !containsEnvNameFold(overrides, name) {
+		if !ok {
 			result = append(result, entry)
+			continue
 		}
+		if strings.HasPrefix(strings.ToUpper(name), windowsShimReservedPrefix) {
+			continue
+		}
+		result = append(result, entry)
 	}
-	names := make([]string, 0, len(overrides))
-	for name := range overrides {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		result = append(result, name+"="+overrides[name])
-	}
+	result = append(result, windowsShimInvocationEnv+"="+encoded)
 	return result
-}
-
-func containsEnvNameFold(values map[string]string, candidate string) bool {
-	for name := range values {
-		if strings.EqualFold(name, candidate) {
-			return true
-		}
-	}
-	return false
 }
