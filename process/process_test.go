@@ -67,6 +67,17 @@ func TestRejectsShellCommands(t *testing.T) {
 	}
 }
 
+func TestRejectsUnknownCommandMode(t *testing.T) {
+	_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
+		Command:     os.Args[0],
+		CommandMode: adapterprocess.CommandMode(255),
+		Dir:         t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported process command mode: 255") {
+		t.Fatalf("Run error = %v, want unsupported command-mode error", err)
+	}
+}
+
 func TestRequiresAbsoluteWorkingDirectory(t *testing.T) {
 	_, err := adapterprocess.CleanWorkingDir("relative")
 	if err == nil || !strings.Contains(err.Error(), "must be absolute") {

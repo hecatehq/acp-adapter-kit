@@ -38,6 +38,17 @@ nil or empty means inherit nothing, so provider subprocesses cannot recover
 secrets from the host process. At the lower-level process API, a nil base keeps
 the standalone adapter's normal system-environment behavior.
 
+The lower-level `process.Spec` and `process.StartSpec` APIs run commands with
+direct fixed argv by default and continue to reject shells. Windows package
+managers may expose a provider as an absolute `.cmd` or `.bat` launcher; a host
+can opt that exact launcher into `CommandModeWindowsCommandShim`. This mode is
+rejected on non-Windows systems. On Windows it validates the launcher and every
+argument against command-interpreter metacharacters, then invokes only the
+trusted System32 `cmd.exe` with fixed switches and kit-owned environment
+indirection. It is intentionally not a general shell escape hatch: relative
+launchers, other script types, direct shell commands, and unsafe values fail
+closed.
+
 Adapters have two runtime integration paths:
 
 - `runtimehost` / `runtimebridge` proxy an explicit child ACP runtime process.

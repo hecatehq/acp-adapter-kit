@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,57 @@ func TestContextCancellationKillsDescendantProcessGroup(t *testing.T) {
 	time.Sleep(650 * time.Millisecond)
 	if _, statErr := os.Stat(mutationPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("descendant mutated workspace after cancellation: %v", statErr)
+	}
+}
+
+func TestWindowsCommandShimModeIsRejectedOffWindows(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "agent.cmd")
+	workDir := t.TempDir()
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "run",
+			run: func() error {
+				_, err := adapterprocess.Run(context.Background(), adapterprocess.Spec{
+					Command:     shim,
+					CommandMode: adapterprocess.CommandModeWindowsCommandShim,
+					Dir:         workDir,
+				})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			run: func() error {
+				_, err := adapterprocess.RunStream(context.Background(), adapterprocess.Spec{
+					Command:     shim,
+					CommandMode: adapterprocess.CommandModeWindowsCommandShim,
+					Dir:         workDir,
+				}, nil)
+				return err
+			},
+		},
+		{
+			name: "start",
+			run: func() error {
+				_, err := adapterprocess.Start(context.Background(), adapterprocess.StartSpec{
+					Command:     shim,
+					CommandMode: adapterprocess.CommandModeWindowsCommandShim,
+					Dir:         workDir,
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.run()
+			if err == nil || !strings.Contains(err.Error(), "Windows command-shim mode is unavailable") {
+				t.Fatalf("error = %v, want platform rejection", err)
+			}
+		})
 	}
 }
 

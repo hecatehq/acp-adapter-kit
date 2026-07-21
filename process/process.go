@@ -20,8 +20,22 @@ const (
 	RedactedValue      = "[redacted]"
 )
 
+// CommandMode selects the process launch mechanism. The zero value preserves
+// direct fixed-argv execution and never invokes a shell.
+type CommandMode uint8
+
+const (
+	CommandModeDirect CommandMode = iota
+	// CommandModeWindowsCommandShim explicitly opts an absolute .cmd or .bat
+	// launcher into the constrained Windows command-shim bridge. The bridge is
+	// unavailable on other platforms and does not permit callers to launch a
+	// shell directly.
+	CommandModeWindowsCommandShim
+)
+
 type Spec struct {
 	Command     string
+	CommandMode CommandMode
 	Args        []string
 	Dir         string
 	Env         EnvPolicy
@@ -31,6 +45,7 @@ type Spec struct {
 
 type StartSpec struct {
 	Command     string
+	CommandMode CommandMode
 	Args        []string
 	Dir         string
 	Env         EnvPolicy
@@ -105,7 +120,7 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 		ctx = context.Background()
 	}
 
-	resolved, err := resolveCommand(spec.Command, baseEnv)
+	resolved, err := resolveCommandForMode(spec.Command, spec.CommandMode, baseEnv)
 	if err != nil {
 		return Result{}, err
 	}
@@ -120,11 +135,15 @@ func RunWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
+	launchCommand, launchArgs, env, err := prepareCommandForMode(spec.CommandMode, resolved, spec.Args, env)
+	if err != nil {
+		return Result{}, err
+	}
 
 	stdout := newLimitedBuffer(limitOrDefault(spec.StdoutLimit))
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
-	cmd := exec.Command(resolved, spec.Args...)
+	cmd := newProcessCommand(spec.CommandMode, launchCommand, launchArgs)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -168,7 +187,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 		ctx = context.Background()
 	}
 
-	resolved, err := resolveCommand(spec.Command, baseEnv)
+	resolved, err := resolveCommandForMode(spec.Command, spec.CommandMode, baseEnv)
 	if err != nil {
 		return Result{}, err
 	}
@@ -180,6 +199,10 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 		return Result{}, err
 	}
 	env, err := BuildEnv(resolveBaseEnv(baseEnv), spec.Env)
+	if err != nil {
+		return Result{}, err
+	}
+	launchCommand, launchArgs, env, err := prepareCommandForMode(spec.CommandMode, resolved, spec.Args, env)
 	if err != nil {
 		return Result{}, err
 	}
@@ -203,7 +226,7 @@ func RunStreamWithBaseEnv(ctx context.Context, spec Spec, baseEnv []string, onSt
 	}
 	stderr := newLimitedBuffer(limitOrDefault(spec.StderrLimit))
 
-	cmd = exec.Command(resolved, spec.Args...)
+	cmd = newProcessCommand(spec.CommandMode, launchCommand, launchArgs)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -262,7 +285,7 @@ func StartWithBaseEnv(ctx context.Context, spec StartSpec, baseEnv []string) (*C
 		ctx = context.Background()
 	}
 
-	resolved, err := resolveCommand(spec.Command, baseEnv)
+	resolved, err := resolveCommandForMode(spec.Command, spec.CommandMode, baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -277,13 +300,17 @@ func StartWithBaseEnv(ctx context.Context, spec StartSpec, baseEnv []string) (*C
 	if err != nil {
 		return nil, err
 	}
+	launchCommand, launchArgs, env, err := prepareCommandForMode(spec.CommandMode, resolved, spec.Args, env)
+	if err != nil {
+		return nil, err
+	}
 	// Refuse an already-cancelled launch before StdinPipe and StdoutPipe
 	// allocate child-side descriptors that only Cmd.Start can close.
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("start process %q: process cancelled: %w", resolved, err)
 	}
 
-	cmd := exec.Command(resolved, spec.Args...)
+	cmd := newProcessCommand(spec.CommandMode, launchCommand, launchArgs)
 	configureProcessUnit(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
@@ -430,6 +457,35 @@ func (c *Child) StderrTruncated() bool {
 
 func ResolveCommand(command string) (string, error) {
 	return resolveCommand(command, nil)
+}
+
+func resolveCommandForMode(command string, mode CommandMode, baseEnv []string) (string, error) {
+	switch mode {
+	case CommandModeDirect:
+		resolved, err := resolveCommand(command, baseEnv)
+		if err != nil {
+			return "", err
+		}
+		if err := validateDirectCommand(resolved); err != nil {
+			return "", err
+		}
+		return resolved, nil
+	case CommandModeWindowsCommandShim:
+		return resolveWindowsCommandShim(command)
+	default:
+		return "", fmt.Errorf("unsupported process command mode: %d", mode)
+	}
+}
+
+func prepareCommandForMode(mode CommandMode, command string, args []string, env []string) (string, []string, []string, error) {
+	switch mode {
+	case CommandModeDirect:
+		return command, append([]string(nil), args...), env, nil
+	case CommandModeWindowsCommandShim:
+		return prepareWindowsCommandShim(command, args, env)
+	default:
+		return "", nil, nil, fmt.Errorf("unsupported process command mode: %d", mode)
+	}
 }
 
 func resolveCommand(command string, baseEnv []string) (string, error) {
