@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"testing"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
@@ -70,22 +71,112 @@ func (c *Client) Send(envelope any) []Response {
 	if err := json.NewEncoder(&input).Encode(envelope); err != nil {
 		c.t.Fatalf("encode request: %v", err)
 	}
+	var request struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(input.Bytes(), &request); err != nil {
+		c.t.Fatalf("decode request: %v", err)
+	}
+	if len(request.ID) == 0 {
+		return c.sendStatic(input.Bytes())
+	}
+	return c.sendUntilResponse(input.Bytes(), request.ID)
+}
+
+func (c *Client) sendStatic(input []byte) []Response {
+	c.t.Helper()
 
 	var output bytes.Buffer
-	if err := c.server.Serve(&input, &output); err != nil {
+	if err := c.server.Serve(bytes.NewReader(input), &output); err != nil {
 		c.t.Fatalf("serve request: %v", err)
 	}
 	return decodeResponses(c.t, output.Bytes())
 }
 
+func (c *Client) sendUntilResponse(input []byte, requestID json.RawMessage) []Response {
+	c.t.Helper()
+
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	serveDone := make(chan error, 1)
+	go func() {
+		err := c.server.Serve(inputReader, outputWriter)
+		_ = outputWriter.Close()
+		serveDone <- err
+	}()
+	type decodedResponse struct {
+		response Response
+		err      error
+	}
+	decoded := make(chan decodedResponse)
+	stop := make(chan struct{})
+	go func() {
+		defer close(decoded)
+		decoder := json.NewDecoder(outputReader)
+		for {
+			var response Response
+			if err := decoder.Decode(&response); err != nil {
+				if err != io.EOF {
+					select {
+					case decoded <- decodedResponse{err: err}:
+					case <-stop:
+					}
+				}
+				return
+			}
+			select {
+			case decoded <- decodedResponse{response: response}:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		_ = inputWriter.Close()
+		_ = outputReader.Close()
+	}()
+
+	if _, err := inputWriter.Write(input); err != nil {
+		c.t.Fatalf("write request: %v", err)
+	}
+	responses := make([]Response, 0, 1)
+	for {
+		result, ok := <-decoded
+		if !ok {
+			err := <-serveDone
+			if err != nil {
+				c.t.Fatalf("serve request: %v", err)
+			}
+			c.t.Fatalf("server closed before response %s", requestID)
+		}
+		if result.err != nil {
+			c.t.Fatalf("decode response: %v", result.err)
+		}
+		responses = append(responses, result.response)
+		if result.response.Method == "" && bytes.Equal(result.response.ID, requestID) {
+			break
+		}
+	}
+	if err := inputWriter.Close(); err != nil {
+		c.t.Fatalf("close input: %v", err)
+	}
+	for result := range decoded {
+		if result.err != nil {
+			c.t.Fatalf("decode response: %v", result.err)
+		}
+		responses = append(responses, result.response)
+	}
+	if err := <-serveDone; err != nil {
+		c.t.Fatalf("serve request: %v", err)
+	}
+	return responses
+}
+
 func (c *Client) SendRaw(raw string) []Response {
 	c.t.Helper()
 
-	var output bytes.Buffer
-	if err := c.server.Serve(bytes.NewBufferString(raw), &output); err != nil {
-		c.t.Fatalf("serve raw request: %v", err)
-	}
-	return decodeResponses(c.t, output.Bytes())
+	return c.sendStatic([]byte(raw))
 }
 
 func (r Response) ResultInto(t testing.TB, target any) {

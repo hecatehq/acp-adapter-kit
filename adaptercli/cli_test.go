@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hecatehq/acp-adapter-kit/acp"
 	"github.com/hecatehq/acp-adapter-kit/adaptercli"
@@ -144,13 +146,14 @@ func TestRuntimeFlagsUseConfiguredEnvironmentPolicy(t *testing.T) {
 }
 
 func TestCommandBridgeServesSessionMethodsWithoutRuntimeFlags(t *testing.T) {
-	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	input := strings.NewReader(strings.Join([]string{
-		`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp/work"}}`,
-		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"hello"}]}}`,
-	}, "\n") + "\n")
-	spec := testSpec(input, &stdout, &stderr)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	defer func() {
+		_ = inputWriter.Close()
+		_ = outputReader.Close()
+	}()
+	spec := testSpec(inputReader, outputWriter, &stderr)
 	spec.Command = &commandbridge.Spec{
 		NewID: func() string { return "session-1" },
 		BuildPrompt: func(session commandbridge.Session, params runtimeacp.PromptParams) (adapterprocess.Spec, error) {
@@ -168,14 +171,79 @@ func TestCommandBridgeServesSessionMethodsWithoutRuntimeFlags(t *testing.T) {
 		}),
 	}
 
-	code := adaptercli.Run(nil, spec)
+	runDone := make(chan int, 1)
+	go func() {
+		code := adaptercli.Run(nil, spec)
+		_ = outputWriter.Close()
+		runDone <- code
+	}()
+	type decodedResponse struct {
+		response cliResponse
+		err      error
+	}
+	decoded := make(chan decodedResponse, 16)
+	go func() {
+		defer close(decoded)
+		decoder := json.NewDecoder(outputReader)
+		for {
+			var response cliResponse
+			if err := decoder.Decode(&response); err != nil {
+				if err != io.EOF {
+					decoded <- decodedResponse{err: err}
+				}
+				return
+			}
+			decoded <- decodedResponse{response: response}
+		}
+	}()
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp/work"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"session-1","prompt":[{"type":"text","text":"hello"}]}}`,
+	} {
+		if _, err := fmt.Fprintln(inputWriter, line); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+	}
+	responses := make([]cliResponse, 0, 5)
+waitForPromptResponse:
+	for {
+		select {
+		case result, ok := <-decoded:
+			if !ok {
+				t.Fatal("ACP server closed before the prompt response")
+			}
+			if result.err != nil {
+				t.Fatalf("decode ACP response: %v", result.err)
+			}
+			responses = append(responses, result.response)
+			if result.response.Method == "" && string(result.response.ID) == "2" {
+				break waitForPromptResponse
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for prompt response")
+		}
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	var code int
+	select {
+	case code = <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for adapter CLI shutdown")
+	}
+	for result := range decoded {
+		if result.err != nil {
+			t.Fatalf("decode ACP response: %v", result.err)
+		}
+		responses = append(responses, result.response)
+	}
 
 	if code != 0 {
-		t.Fatalf("Run returned %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+		t.Fatalf("Run returned %d, want 0; stderr=%q", code, stderr.String())
 	}
-	responses := decodeResponses(t, stdout.Bytes())
 	if len(responses) != 5 {
-		t.Fatalf("got %d responses, want session/new + tool start + chunk + tool finish + prompt\n%s", len(responses), stdout.String())
+		t.Fatalf("got %d responses, want session/new + tool start + chunk + tool finish + prompt", len(responses))
 	}
 	start := decodeCLIUpdate(t, responses[1])
 	if start.Update.SessionUpdate != "tool_call" ||
@@ -267,7 +335,7 @@ func TestDoctorCommandWritesTextFailureAndReturnsError(t *testing.T) {
 	}
 }
 
-func testSpec(stdin *strings.Reader, stdout *bytes.Buffer, stderr *bytes.Buffer) adaptercli.Spec {
+func testSpec(stdin io.Reader, stdout io.Writer, stderr *bytes.Buffer) adaptercli.Spec {
 	return adaptercli.Spec{
 		Info: acp.AdapterInfo{
 			Name:    "test-acp-adapter",
